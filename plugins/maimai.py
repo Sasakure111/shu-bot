@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import MessageEvent, Message
 from nonebot.params import CommandArg
+from .message_utils import reply_message, should_ignore_group_message
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env.prod")
 
@@ -114,15 +115,18 @@ b50_cmd = on_command("b50", priority=5, block=True)
 
 @b50_cmd.handle()
 async def handle_b50(event: MessageEvent, args: Message = CommandArg()):
+    if should_ignore_group_message(event):
+        return
+
     username = args.extract_plain_text().strip()
     if not username:
-        await b50_cmd.finish("用法：/b50 <水鱼用户名>")
+        await b50_cmd.finish(reply_message(event, "用法：/b50 <水鱼用户名>"))
     if not DIVING_FISH_TOKEN:
-        await b50_cmd.finish("token 未配置，请联系管理员")
+        await b50_cmd.finish(reply_message(event, "token 未配置，请联系管理员"))
     
-    await b50_cmd.send("查询中，请稍等...")
+    await b50_cmd.send(reply_message(event, "查询中，请稍等..."))
     data, err = await fetch_b50(username, DIVING_FISH_TOKEN)
     if err:
-        await b50_cmd.finish(f"查询失败：{err}")
+        await b50_cmd.finish(reply_message(event, f"查询失败：{err}"))
     
-    await b50_cmd.finish(format_b50(data))
+    await b50_cmd.finish(reply_message(event, format_b50(data)))

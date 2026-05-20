@@ -8,6 +8,7 @@ from nonebot.adapters.onebot.v11 import PrivateMessageEvent, Message
 from nonebot.params import CommandArg
 import os
 
+from .database import add_chat_messages, load_recent_chat_history
 from .state import MAX_HISTORY_TURNS, chat_history, recently_added_friends
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env.prod")
@@ -151,12 +152,19 @@ async def handle_tarot_question(event: PrivateMessageEvent):
         # 在解读后追加免责声明
         full_reply = reply + "\n\n———\n💫 塔罗只是娱乐和自我反思的小工具,认真你就输啦 ⌓‿⌓ 真正的答案在你自己心里！"
         
-        history = chat_history.setdefault(user_id, [])
-        history.append({
+        user_history_message = {
             "role": "user",
             "content": f"塔罗提问: {question}\n抽到的牌: {card['name']} - {position}\n牌面关键词: {meaning}",
-        })
-        history.append({"role": "assistant", "content": full_reply})
+        }
+        assistant_history_message = {"role": "assistant", "content": full_reply}
+
+        history = chat_history.setdefault(
+            user_id,
+            load_recent_chat_history(user_id, MAX_HISTORY_TURNS * 2),
+        )
+        history.append(user_history_message)
+        history.append(assistant_history_message)
+        add_chat_messages(user_id, [user_history_message, assistant_history_message])
 
         if len(history) > MAX_HISTORY_TURNS * 2:
             del history[0:2]

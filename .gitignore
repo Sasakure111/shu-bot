@@ -22,6 +22,8 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 data/
 
 # ===== IDE / 编辑器 =====
@@ -38,5 +40,14 @@ desktop.ini
 # ===== NoneBot 相关缓存 =====
 .cache/
 
-# ===== 个性化配置=====
+# ===== 个性化配置 =====
 config/persona.txt
+
+# ===== Python 打包产物 =====
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ===== 其它 ===== （仅供个人启动bot方便调试使用）
+start.bat

@@ -4,8 +4,10 @@ load_dotenv(".env.prod")
 import os
 from openai import OpenAI
 from nonebot import on_message, on_command
-from nonebot.adapters.onebot.v11 import PrivateMessageEvent, Message
+from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, Message
 from nonebot.params import CommandArg
+from .database import add_chat_messages, load_recent_chat_history
+from .message_utils import plain_text_without_bot_at, reply_message, should_ignore_group_message
 
 client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -51,6 +53,19 @@ async def handle_menu(event: PrivateMessageEvent):
 
 🎵 maimai
   /b50 <水鱼用户名>     (查询B50)
+
+🐾 宠物
+  /我的宠物              (查看/初次领取宠物)
+  /查看仓库              (查看已拥有的宠物)
+  /切换宠物 <宠物id>     (切换当前携带宠物)
+  /打卡                  (每日一次,增加经验)
+  /玩耍                  (每小时一次,额外经验)
+  /互动                  (与高好感度宠物互动)
+  /捕捉                  (捕捉播报出现的野生宠物)
+  /讨伐                  (参与群聊公屏Boss)
+  /发起对战 @用户        (发起宠物对战)
+  /接受挑战              (接受别人发起的宠物对战)
+  /开启播报 /关闭播报   (控制野生宠物播报)
 """
     await menu_cmd.finish(menu_text)
 
@@ -58,8 +73,11 @@ async def handle_menu(event: PrivateMessageEvent):
 chat = on_message(priority=10, block=True)
 
 @chat.handle()
-async def handle_chat(event: PrivateMessageEvent):
-    user_msg = event.get_plaintext().strip()
+async def handle_chat(event: MessageEvent):
+    if should_ignore_group_message(event):
+        return
+
+    user_msg = plain_text_without_bot_at(event)
     print(f"[DEBUG] 收到消息: {user_msg}")
     user_id = event.user_id
     
@@ -70,7 +88,10 @@ async def handle_chat(event: PrivateMessageEvent):
         print(f"[DEBUG] 用户 {user_id} 是刚加的好友,跳过本次回复")
         return
 
-    history = chat_history.setdefault(user_id, [])
+    history = chat_history.setdefault(
+        user_id,
+        load_recent_chat_history(user_id, MAX_HISTORY_TURNS * 2),
+    )
 
     # 拼接 messages: system + 历史 + 本次用户消息
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -89,14 +110,21 @@ async def handle_chat(event: PrivateMessageEvent):
         # 把这一轮加入历史
         history.append({"role": "user", "content": user_msg})
         history.append({"role": "assistant", "content": reply})
+        add_chat_messages(
+            user_id,
+            [
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": reply},
+            ],
+        )
         
         # 限制历史长度: 保留最近 MAX_HISTORY_TURNS 轮(每轮 2 条)
         if len(history) > MAX_HISTORY_TURNS * 2:
             # 删掉最旧的两条(一轮)
             del history[0:2]
         
-        await chat.send(reply)
+        await chat.send(reply_message(event, reply))
         
     except Exception as e:
         print(f"[DEBUG] 出错了: {type(e).__name__}: {e}")
-        await chat.send(f"bot出错了 ＞＜:{type(e).__name__}")
+        await chat.send(reply_message(event, f"bot出错了 ＞＜:{type(e).__name__}"))
