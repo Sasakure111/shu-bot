@@ -4,12 +4,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from nonebot import on_command, on_message
-from nonebot.adapters.onebot.v11 import PrivateMessageEvent, Message
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageEvent, PrivateMessageEvent
 from nonebot.params import CommandArg
 import os
 
 from .database import add_chat_messages, load_recent_chat_history
 from .state import MAX_HISTORY_TURNS, chat_history, recently_added_friends
+from .message_utils import reply_message
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env.prod")
 
@@ -59,14 +60,98 @@ async def is_waiting_for_tarot_question(event: PrivateMessageEvent) -> bool:
     return event.user_id in waiting_for_question
 
 
+async def _build_tarot_reply(user_id: int, question: str, save_history: bool) -> str:
+    card = random.choice(TAROT_DECK)
+    is_upright = random.random() < 0.6
+    position = "正位" if is_upright else "逆位"
+    meaning = card["upright"] if is_upright else card["reversed"]
+
+    print(f"[DEBUG] 用户 {user_id} 塔罗占卜: 问题={question}, 牌={card['name']} {position}")
+
+    tarot_prompt = f"""你是一位神秘但温柔的塔罗占卜师「OW」,现在要为来访者解读塔罗牌。
+
+来访者的问题: {question}
+
+抽到的牌: {card['name']} - {position}
+牌面关键词: {meaning}
+
+请按以下格式输出解读(不要超过 200 字):
+
+🎴 抽到了「{card['name']}」- {position}
+
+【牌面】(用一两句话描述这张牌的画面/象征)
+
+【OW的解读】(结合来访者的问题,给出温柔但有深度的解读。可以指出当下状态、给点小建议。语气可以稍微神秘但不要装神弄鬼)
+
+注意:
+- 不要给极端的预言(比如"你一定会..."、"绝对不要...")
+- 保持开放性,留给来访者自己思考的空间
+- 偶尔可以用一两个颜文字,但不要过度
+- 不要过度承诺好结果或恐吓坏结果"""
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "你是一位塔罗占卜师,擅长结合具体问题给出有启发性的解读。"},
+            {"role": "user", "content": tarot_prompt},
+        ],
+        max_tokens=400,
+    )
+    reply = response.choices[0].message.content
+
+    full_reply = reply + "\n\n———\n💫 塔罗只是娱乐和自我反思的小工具,认真你就输啦 ⌓‿⌓ 真正的答案在你自己心里！"
+
+    if save_history:
+        user_history_message = {
+            "role": "user",
+            "content": f"塔罗提问: {question}\n抽到的牌: {card['name']} - {position}\n牌面关键词: {meaning}",
+        }
+        assistant_history_message = {"role": "assistant", "content": full_reply}
+
+        history = chat_history.setdefault(
+            user_id,
+            load_recent_chat_history(user_id, MAX_HISTORY_TURNS * 2),
+        )
+        history.append(user_history_message)
+        history.append(assistant_history_message)
+        add_chat_messages(user_id, [user_history_message, assistant_history_message])
+
+        if len(history) > MAX_HISTORY_TURNS * 2:
+            del history[0:2]
+
+    return full_reply
+
+
 # ===== /塔罗 命令: 进入算塔罗状态 =====
 tarot_start = on_command("塔罗", aliases={"抽塔罗", "占卜"}, priority=1, block=True)
 
 @tarot_start.handle()
-async def handle_tarot_start(event: PrivateMessageEvent):
+async def handle_tarot_start(event: MessageEvent, args: Message = CommandArg()):
+    question = args.extract_plain_text().strip()
+
+    if question:
+        # 有内联问题，直接占卜（私聊和群聊均支持）
+        try:
+            full_reply = await _build_tarot_reply(
+                event.user_id, question, isinstance(event, PrivateMessageEvent)
+            )
+        except Exception as e:
+            print(f"[DEBUG] 塔罗 AI 调用失败: {type(e).__name__}: {e}")
+            await tarot_start.finish(reply_message(event, f"水晶球出问题了 ＞＜: {type(e).__name__}"))
+        await tarot_start.finish(reply_message(event, full_reply))
+        return
+
+    if isinstance(event, GroupMessageEvent):
+        # 群聊不支持两步交互，提示用内联格式
+        await tarot_start.finish(
+            reply_message(event, "🔮 请用 /塔罗 <你的问题> 进行占卜，例如：/塔罗 今天运气怎么样~")
+        )
+        return
+
+    # 私聊：进入两步交互流程
     user_id = event.user_id
     waiting_for_question[user_id] = True
-    
+
     await tarot_start.send(
         "🔮 水晶球已就位\n"
         "想问什么呢? 直接告诉我你的困扰 ⌓‿⌓\n"
@@ -104,73 +189,13 @@ async def handle_tarot_question(event: PrivateMessageEvent):
     
     if not question:
         return
-    
+
     # 清除等待状态
     del waiting_for_question[user_id]
-    
-    # 抽牌 (随机选一张 + 60% 正位 / 40% 逆位)
-    card = random.choice(TAROT_DECK)
-    is_upright = random.random() < 0.6
-    position = "正位" if is_upright else "逆位"
-    meaning = card["upright"] if is_upright else card["reversed"]
-    
-    print(f"[DEBUG] 用户 {user_id} 塔罗占卜: 问题={question}, 牌={card['name']} {position}")
-    
-    # 调用 AI 生成解读
-    tarot_prompt = f"""你是一位神秘但温柔的塔罗占卜师「OW」,现在要为来访者解读塔罗牌。
-
-来访者的问题: {question}
-
-抽到的牌: {card['name']} - {position}
-牌面关键词: {meaning}
-
-请按以下格式输出解读(不要超过 200 字):
-
-🎴 抽到了「{card['name']}」- {position}
-
-【牌面】(用一两句话描述这张牌的画面/象征)
-
-【OW的解读】(结合来访者的问题,给出温柔但有深度的解读。可以指出当下状态、给点小建议。语气可以稍微神秘但不要装神弄鬼)
-
-注意:
-- 不要给极端的预言(比如"你一定会..."、"绝对不要...")
-- 保持开放性,留给来访者自己思考的空间
-- 偶尔可以用一两个颜文字,但不要过度
-- 不要过度承诺好结果或恐吓坏结果"""
 
     try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "你是一位塔罗占卜师,擅长结合具体问题给出有启发性的解读。"},
-                {"role": "user", "content": tarot_prompt},
-            ],
-            max_tokens=400,
-        )
-        reply = response.choices[0].message.content
-        
-        # 在解读后追加免责声明
-        full_reply = reply + "\n\n———\n💫 塔罗只是娱乐和自我反思的小工具,认真你就输啦 ⌓‿⌓ 真正的答案在你自己心里！"
-        
-        user_history_message = {
-            "role": "user",
-            "content": f"塔罗提问: {question}\n抽到的牌: {card['name']} - {position}\n牌面关键词: {meaning}",
-        }
-        assistant_history_message = {"role": "assistant", "content": full_reply}
-
-        history = chat_history.setdefault(
-            user_id,
-            load_recent_chat_history(user_id, MAX_HISTORY_TURNS * 2),
-        )
-        history.append(user_history_message)
-        history.append(assistant_history_message)
-        add_chat_messages(user_id, [user_history_message, assistant_history_message])
-
-        if len(history) > MAX_HISTORY_TURNS * 2:
-            del history[0:2]
-
+        full_reply = await _build_tarot_reply(user_id, question, True)
         await tarot_question.send(full_reply)
-        
     except Exception as e:
         print(f"[DEBUG] 塔罗 AI 调用失败: {type(e).__name__}: {e}")
         await tarot_question.send(f"水晶球出问题了 ＞＜: {type(e).__name__}")

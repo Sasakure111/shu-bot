@@ -32,7 +32,7 @@ else:
 menu_cmd = on_command("菜单", priority=1, block=True)
 
 @menu_cmd.handle()
-async def handle_menu(event: PrivateMessageEvent):
+async def handle_menu(event: MessageEvent):
     menu_text = """指令菜单
 
 💬 聊天
@@ -58,6 +58,7 @@ async def handle_menu(event: PrivateMessageEvent):
   /我的宠物              (查看/初次领取宠物)
   /查看仓库              (查看已拥有的宠物)
   /切换宠物 <宠物id>     (切换当前携带宠物)
+    示例：/切换宠物 1
   /打卡                  (每日一次,增加经验)
   /玩耍                  (每小时一次,额外经验)
   /互动                  (与高好感度宠物互动)
@@ -66,6 +67,8 @@ async def handle_menu(event: PrivateMessageEvent):
   /发起对战 @用户        (发起宠物对战)
   /接受挑战              (接受别人发起的宠物对战)
   /开启播报 /关闭播报   (控制野生宠物播报)
+
+  *温馨提示：群聊内互动要 @我 哦！
 """
     await menu_cmd.finish(menu_text)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -12,17 +13,27 @@ PET_TYPES = [
     ("小团雀", 1, 20),
     ("云朵猫", 1, 20),
     ("大香肠", 1, 20),
+    ("啵啵", 1, 20),
+    ("四足蛇", 1, 20),
     ("广式双马尾", 1, 20),
     ("奶茶史莱姆", 1, 20),
     ("月牙兔", 2, 28),
+    ("延津虾", 2, 28),
+    ("尔都龙", 2, 28),
     ("地精小老头", 2, 28),
+    ("大香蕉", 2, 28),
     ("糖霜狐", 2, 28),
     ("风铃鹿", 3, 38),
+    ("豆包", 3, 38),
     ("星尘水母", 3, 38),
+    ("笑面虎", 3, 38),
+    ("乌角鲨", 3, 38),
     ("春岚猫又", 3, 38),
     ("扑棱蛾子", 3, 38),
+    ("刺头大佬", 3, 38),
     ("能丶丶丶丶", 4, 52),
     ("琉璃龙", 4, 52),
+    ("纸老虎", 4, 52),
     ("小火柴", 4, 52),
     ("夜航鲸", 4, 52),
     ("极光凤凰", 5, 70),
@@ -157,6 +168,74 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_pets_owner
             ON pets (owner_user_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rpg_players (
+                user_id INTEGER PRIMARY KEY,
+                level INTEGER NOT NULL DEFAULT 1,
+                exp INTEGER NOT NULL DEFAULT 0,
+                reputation INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '籍籍无名',
+                total_runs INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                deaths INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rpg_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('standard', 'creative')),
+                status TEXT NOT NULL,
+                chapter INTEGER NOT NULL DEFAULT 0,
+                floor INTEGER NOT NULL DEFAULT 0,
+                seed TEXT NOT NULL DEFAULT '',
+                character_json TEXT NOT NULL DEFAULT '{}',
+                map_json TEXT NOT NULL DEFAULT '{}',
+                inventory_json TEXT NOT NULL DEFAULT '[]',
+                flags_json TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TEXT,
+                result TEXT,
+                FOREIGN KEY (user_id) REFERENCES rpg_players(user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rpg_runs_user_status_updated
+            ON rpg_runs (user_id, status, updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rpg_runs_user_finished
+            ON rpg_runs (user_id, finished_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rpg_run_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                log_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES rpg_runs(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rpg_run_logs_run_created
+            ON rpg_run_logs (run_id, created_at, id)
             """
         )
         conn.executemany(
@@ -503,7 +582,7 @@ def add_pet_affection(user_id: int, amount: int) -> sqlite3.Row:
 
 
 def add_pet_reward(user_id: int, exp_amount: int, affection_amount: int) -> tuple[sqlite3.Row, int]:
-    pet, leveled = add_pet_exp(user_id, exp_amount)
+    _, leveled = add_pet_exp(user_id, exp_amount)
     return add_pet_affection(user_id, affection_amount), leveled
 
 
@@ -619,6 +698,293 @@ def get_enabled_broadcast_targets() -> list[sqlite3.Row]:
             FROM broadcast_settings
             WHERE enabled = 1
             """
+        ).fetchall()
+
+
+def _to_json(data: object, default: object) -> str:
+    if data is None:
+        data = default
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _decode_json_field(row: sqlite3.Row, field: str, default: object) -> object:
+    raw = row[field]
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def ensure_rpg_player(user_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO rpg_players (user_id)
+            VALUES (?)
+            """,
+            (int(user_id),),
+        )
+
+
+def get_rpg_player(user_id: int) -> sqlite3.Row:
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, level, exp, reputation, title, total_runs, wins, deaths,
+                   created_at, updated_at
+            FROM rpg_players
+            WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+
+
+def add_rpg_player_progress(
+    user_id: int,
+    exp_amount: int = 0,
+    reputation_delta: int = 0,
+    title: str | None = None,
+) -> sqlite3.Row:
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        if title is None:
+            conn.execute(
+                """
+                UPDATE rpg_players
+                SET
+                    exp = MAX(0, exp + ?),
+                    reputation = MIN(999, MAX(-999, reputation + ?)),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+                """,
+                (int(exp_amount), int(reputation_delta), int(user_id)),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE rpg_players
+                SET
+                    exp = MAX(0, exp + ?),
+                    reputation = MIN(999, MAX(-999, reputation + ?)),
+                    title = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+                """,
+                (int(exp_amount), int(reputation_delta), title, int(user_id)),
+            )
+    return get_rpg_player(user_id)
+
+
+def create_rpg_run(
+    user_id: int,
+    mode: str,
+    status: str = "mode_select",
+    seed: str = "",
+    character: object | None = None,
+    map_data: object | None = None,
+    inventory: object | None = None,
+    flags: object | None = None,
+) -> int:
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO rpg_runs (
+                user_id, mode, status, seed,
+                character_json, map_json, inventory_json, flags_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id),
+                mode,
+                status,
+                seed,
+                _to_json(character, {}),
+                _to_json(map_data, {}),
+                _to_json(inventory, []),
+                _to_json(flags, {}),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_rpg_run(run_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, mode, status, chapter, floor, seed,
+                   character_json, map_json, inventory_json, flags_json,
+                   started_at, updated_at, finished_at, result
+            FROM rpg_runs
+            WHERE id = ?
+            """,
+            (int(run_id),),
+        ).fetchone()
+
+
+def get_active_rpg_run(user_id: int) -> sqlite3.Row | None:
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, mode, status, chapter, floor, seed,
+                   character_json, map_json, inventory_json, flags_json,
+                   started_at, updated_at, finished_at, result
+            FROM rpg_runs
+            WHERE user_id = ? AND finished_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(user_id),),
+        ).fetchone()
+
+
+def decode_rpg_run_state(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": int(row["id"]),
+        "user_id": int(row["user_id"]),
+        "mode": row["mode"],
+        "status": row["status"],
+        "chapter": int(row["chapter"]),
+        "floor": int(row["floor"]),
+        "seed": row["seed"],
+        "character": _decode_json_field(row, "character_json", {}),
+        "map": _decode_json_field(row, "map_json", {}),
+        "inventory": _decode_json_field(row, "inventory_json", []),
+        "flags": _decode_json_field(row, "flags_json", {}),
+        "started_at": row["started_at"],
+        "updated_at": row["updated_at"],
+        "finished_at": row["finished_at"],
+        "result": row["result"],
+    }
+
+
+def save_rpg_run_state(
+    run_id: int,
+    *,
+    status: str | None = None,
+    chapter: int | None = None,
+    floor: int | None = None,
+    character: object | None = None,
+    map_data: object | None = None,
+    inventory: object | None = None,
+    flags: object | None = None,
+) -> sqlite3.Row | None:
+    fields: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
+    values: list[object] = []
+
+    if status is not None:
+        fields.append("status = ?")
+        values.append(status)
+    if chapter is not None:
+        fields.append("chapter = ?")
+        values.append(int(chapter))
+    if floor is not None:
+        fields.append("floor = ?")
+        values.append(int(floor))
+    if character is not None:
+        fields.append("character_json = ?")
+        values.append(_to_json(character, {}))
+    if map_data is not None:
+        fields.append("map_json = ?")
+        values.append(_to_json(map_data, {}))
+    if inventory is not None:
+        fields.append("inventory_json = ?")
+        values.append(_to_json(inventory, []))
+    if flags is not None:
+        fields.append("flags_json = ?")
+        values.append(_to_json(flags, {}))
+
+    values.append(int(run_id))
+    with _connect() as conn:
+        conn.execute(
+            f"""
+            UPDATE rpg_runs
+            SET {", ".join(fields)}
+            WHERE id = ?
+            """,
+            values,
+        )
+    return get_rpg_run(run_id)
+
+
+def finish_rpg_run(
+    run_id: int,
+    result: str,
+    *,
+    status: str = "finished",
+    exp_amount: int = 0,
+    reputation_delta: int = 0,
+    won: bool = False,
+    died: bool = False,
+) -> sqlite3.Row | None:
+    run = get_rpg_run(run_id)
+    if run is None:
+        return None
+
+    user_id = int(run["user_id"])
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE rpg_runs
+            SET
+                status = ?,
+                result = ?,
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, result, int(run_id)),
+        )
+        conn.execute(
+            """
+            UPDATE rpg_players
+            SET
+                total_runs = total_runs + 1,
+                wins = wins + ?,
+                deaths = deaths + ?,
+                exp = MAX(0, exp + ?),
+                reputation = MIN(999, MAX(-999, reputation + ?)),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+            """,
+            (
+                1 if won else 0,
+                1 if died else 0,
+                int(exp_amount),
+                int(reputation_delta),
+                user_id,
+            ),
+        )
+    return get_rpg_run(run_id)
+
+
+def add_rpg_run_log(run_id: int, log_type: str, content: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO rpg_run_logs (run_id, log_type, content)
+            VALUES (?, ?, ?)
+            """,
+            (int(run_id), log_type, content),
+        )
+
+
+def list_rpg_run_logs(run_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, run_id, log_type, content, created_at
+            FROM rpg_run_logs
+            WHERE run_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(run_id), int(limit)),
         ).fetchall()
 
 

@@ -23,6 +23,7 @@ from .database import (
     ensure_broadcast_target,
     ensure_current_pet,
     exp_to_next_level,
+    get_current_pet,
     get_enabled_broadcast_targets,
     get_last_battle_challenge_at,
     get_last_played_at,
@@ -60,6 +61,8 @@ BOSS_EXPIRE_MINUTES = 15
 BOSS_REWARD_EXP = 90
 BOSS_REWARD_AFFECTION = 8
 BOSS_SPECIAL_REWARD_RATE = 18
+BOSS_ATTACK_COOLDOWN_SECONDS = 15
+BOSS_BROADCAST_INTERVAL_MINUTES = 120
 BATTLE_REWARD_EXP = 24
 BATTLE_WIN_AFFECTION = 4
 BATTLE_LOSE_AFFECTION = -3
@@ -102,8 +105,8 @@ def format_pet_status(pet) -> str:
         f"🐾 当前宠物: {pet['name']} {rarity_stars(pet['rarity'])}\n"
         f"等级: {pet_level_text(level)}\n"
         f"经验: {exp_text}\n"
-        f"血量: {pet['hp']} | 攻击: {pet['attack']} | 速度: {pet['speed']}\n"
-        f"好感度: {pet['affection']}"
+        f"血量: {pet_max_hp(pet)} | 攻击: {pet_attack_power(pet)} | 速度: {pet_speed_value(pet)}\n"
+        f"好感度: {pet['affection']}/100"
     )
 
 
@@ -111,7 +114,7 @@ def format_pet_list(pets) -> str:
     if not pets:
         return "仓库里还没有宠物，先发送 /我的宠物 领取初始宠物吧。"
 
-    lines = [f"📦 宠物仓库（共 {len(pets)} 只）"]
+    lines = [f"📦 宠物仓库（共 {len(pets)}/50 只）"]
     for pet in pets:
         marker = "  当前" if int(pet["id"]) == int(pet["current_pet_id"]) else ""
         next_exp = exp_to_next_level(pet)
@@ -119,8 +122,8 @@ def format_pet_list(pets) -> str:
         lines.append(
             f"ID {pet['id']} | {pet['name']} {rarity_stars(pet['rarity'])} "
             f"| Lv.{pet_level_text(pet['level'])} | EXP {exp_text} "
-            f"| HP {pet['hp']} ATK {pet['attack']} SPD {pet['speed']} "
-            f"| 好感 {pet['affection']}{marker}"
+            f"| HP {pet_max_hp(pet)} ATK {pet_attack_power(pet)} SPD {pet_speed_value(pet)} "
+            f"| 好感 {pet['affection']}/100{marker}"
         )
     lines.append("使用 /切换宠物 <宠物id> 切换当前携带宠物。")
     return "\n".join(lines)
@@ -140,15 +143,15 @@ def capture_rate(carried_pet) -> int:
 
 
 def pet_max_hp(pet) -> int:
-    return int(pet["hp"]) + (int(pet["level"]) - 1) * 8
+    return int(int(pet["hp"]) * (1.5 ** int(pet["level"])))
 
 
 def pet_attack_power(pet) -> int:
-    return int(pet["attack"]) + (int(pet["level"]) - 1) * 3 + int(pet["affection"]) // 20
+    return int(int(pet["attack"]) * (1.5 ** int(pet["level"]))) + int(pet["affection"]) // 20
 
 
 def pet_speed_value(pet) -> int:
-    return int(pet["speed"]) + (int(pet["level"]) - 1) * 2
+    return int(int(pet["speed"]) * (1.5 ** int(pet["level"])))
 
 
 def parse_at_user(message: Message) -> int | None:
@@ -245,6 +248,7 @@ async def send_wild_pet(bot: Bot, target_type: str, target_id: int) -> None:
     active_wild_pets[context_key] = {
         "type_id": int(pet_type["id"]),
         "expires_at": expires_at,
+        "tried_users": set(),
     }
 
     message = (
@@ -267,21 +271,33 @@ async def send_group_boss(bot: Bot, group_id: int) -> None:
         return
 
     name = random.choice(BOSS_NAMES)
-    max_hp = random.randint(520, 760)
+    boss_level = random.randint(1, 5)
+    base_hp = random.randint(200, 350)
+    base_atk = random.randint(20, 30)
+    base_spd = random.randint(8, 15)
+    max_hp = int(base_hp * (1.5 ** boss_level))
+    boss_attack = int(base_atk * (1.5 ** boss_level))
+    boss_speed = int(base_spd * (1.5 ** boss_level))
     expires_at = datetime.now() + timedelta(minutes=BOSS_EXPIRE_MINUTES)
     active_group_bosses[group_id] = {
         "name": name,
+        "level": boss_level,
         "hp": max_hp,
         "max_hp": max_hp,
+        "attack": boss_attack,
+        "speed": boss_speed,
         "expires_at": expires_at,
         "participants": set(),
         "damage": {},
+        "pet_hp": {},
+        "defeated_pets": set(),
+        "last_attack_at": {},
     }
     await bot.send_group_msg(
         group_id=group_id,
         message=(
-            f"⚔️ 公屏 Boss 出现：{name}\n"
-            f"血量: {max_hp}/{max_hp}\n"
+            f"⚔️ 公屏 Boss 出现：{name}（Lv.{boss_level}）\n"
+            f"血量: {max_hp} | 攻击: {boss_attack} | 速度: {boss_speed}\n"
             f"限时 {BOSS_EXPIRE_MINUTES} 分钟，@我并发送 /讨伐 参与挑战！"
         ),
     )
@@ -330,8 +346,11 @@ async def expire_battle_challenges() -> None:
             await bot.send_group_msg(
                 group_id=group_id,
                 message=(
-                    f"对战挑战已超时取消："
-                    f"{challenge['challenger_id']} -> {challenge['defender_id']}"
+                    Message("对战挑战已超时取消：")
+                    + MessageSegment.at(challenge["challenger_id"])
+                    + Message(" 对 ")
+                    + MessageSegment.at(challenge["defender_id"])
+                    + Message(" 的挑战已过期。")
                 ),
             )
         except Exception as exc:
@@ -346,6 +365,8 @@ def build_boss_reward_text(participants: set[int]) -> str:
     special_rewards = []
     for user_id in participants:
         add_pet_reward(user_id, BOSS_REWARD_EXP, BOSS_REWARD_AFFECTION)
+        if len(list_user_pets(user_id)) >= 50:
+            continue
         if random.randint(1, 100) <= BOSS_SPECIAL_REWARD_RATE:
             pet_type = get_random_special_pet_type()
             if pet_type is not None:
@@ -382,7 +403,7 @@ async def pet_wild_broadcast() -> None:
         await send_wild_pet(bot, target["target_type"], int(target["target_id"]))
 
 
-@scheduler.scheduled_job("interval", minutes=120, id="pet_group_boss_broadcast")
+@scheduler.scheduled_job("interval", minutes=BOSS_BROADCAST_INTERVAL_MINUTES, id="pet_group_boss_broadcast")
 async def pet_group_boss_broadcast() -> None:
     targets = [
         target
@@ -579,16 +600,25 @@ async def handle_capture(event: MessageEvent):
         active_wild_pets.pop(context_key, None)
         await capture_cmd.finish(reply_message(event, "附近暂时没有野生宠物，等下一次播报吧。"))
 
-    carried_pet = ensure_current_pet(event.user_id)
+    user_id = int(event.user_id)
+
+    if user_id in wild["tried_users"]:
+        await capture_cmd.finish(reply_message(event, "你已经尝试过捕捉这只宠物了，等下一次播报吧。"))
+
+    if len(list_user_pets(user_id)) >= 50:
+        await capture_cmd.finish(reply_message(event, "你的宠物仓库已满（上限50只），请先整理仓库再捕捉。"))
+
+    carried_pet = ensure_current_pet(user_id)
     rate = capture_rate(carried_pet)
     pet_type = get_pet_type(int(wild["type_id"]))
     if pet_type is None:
         active_wild_pets.pop(context_key, None)
         await capture_cmd.finish(reply_message(event, "这只野生宠物已经跑远了。"))
 
-    active_wild_pets.pop(context_key, None)
+    wild["tried_users"].add(user_id)
     if random.randint(1, 100) <= rate:
-        create_pet_for_user(event.user_id, int(pet_type["id"]), set_current=True)
+        active_wild_pets.pop(context_key, None)
+        create_pet_for_user(user_id, int(pet_type["id"]), set_current=True)
         await capture_cmd.finish(
             reply_message(
                 event,
@@ -618,40 +648,118 @@ async def handle_boss_attack(event: MessageEvent):
         active_group_bosses.pop(int(event.group_id), None)
         await boss_attack_cmd.finish(reply_message(event, "当前群里没有可讨伐的 Boss。"))
 
-    pet = ensure_current_pet(event.user_id)
-    damage = random.randint(
-        max(1, pet_attack_power(pet) - 8),
-        pet_attack_power(pet) + 12,
-    )
-    if random.randint(1, 100) <= 10:
-        damage *= 2
-        crit_text = "暴击！"
+    user_id = int(event.user_id)
+    pet = ensure_current_pet(user_id)
+    pet_id = int(pet["id"])
+
+    if pet_id in boss["defeated_pets"]:
+        await boss_attack_cmd.finish(reply_message(
+            event,
+            f"{pet['name']} 已在本次 Boss 战中倒下，请用 /切换宠物 更换宠物后再上场。"
+        ))
+
+    now = datetime.now()
+    last_at = boss["last_attack_at"].get(user_id)
+    if last_at is not None:
+        elapsed = (now - last_at).total_seconds()
+        if elapsed < BOSS_ATTACK_COOLDOWN_SECONDS:
+            remaining = int(BOSS_ATTACK_COOLDOWN_SECONDS - elapsed) + 1
+            await boss_attack_cmd.finish(reply_message(event, f"讨伐冷却中，还需等待 {remaining} 秒。"))
+
+    boss["last_attack_at"][user_id] = now
+
+    pet_max = pet_max_hp(pet)
+    if pet_id not in boss["pet_hp"]:
+        boss["pet_hp"][pet_id] = pet_max
+    current_pet_hp = int(boss["pet_hp"][pet_id])
+
+    pet_atk = pet_attack_power(pet)
+    pet_spd = pet_speed_value(pet)
+    boss_atk = int(boss["attack"])
+    boss_spd = int(boss["speed"])
+
+    logs = []
+    pet_dealt = 0
+    boss_defeated = False
+    pet_defeated = False
+
+    def roll_pet_hit() -> tuple[int, bool]:
+        dmg = random.randint(max(1, pet_atk - 8), pet_atk + 12)
+        crit = random.randint(1, 100) <= 10
+        return (dmg * 2, True) if crit else (dmg, False)
+
+    def roll_boss_hit() -> tuple[int, bool]:
+        dmg = random.randint(max(1, boss_atk - 5), boss_atk + 8)
+        crit = random.randint(1, 100) <= 10
+        return (dmg * 2, True) if crit else (dmg, False)
+
+    pet_first = pet_spd >= boss_spd
+    if pet_first:
+        logs.append(f"⚡ {pet['name']} 速度（{pet_spd}）≥ Boss 速度（{boss_spd}），先手出击！")
     else:
-        crit_text = ""
+        logs.append(f"⚡ {boss['name']}（Lv.{boss['level']}） 速度（{boss_spd}）> {pet['name']} 速度（{pet_spd}），先手出击！")
 
-    boss["hp"] = max(0, int(boss["hp"]) - damage)
-    participants = boss["participants"]
-    damage_board = boss["damage"]
-    participants.add(int(event.user_id))
-    damage_board[int(event.user_id)] = int(damage_board.get(int(event.user_id), 0)) + damage
+    if pet_first:
+        dmg, crit = roll_pet_hit()
+        pet_dealt = dmg
+        boss["hp"] = max(0, int(boss["hp"]) - dmg)
+        logs.append(f"🗡 {pet['name']} {'暴击！' if crit else ''}对 {boss['name']} 造成 {dmg} 点伤害。")
 
-    if int(boss["hp"]) <= 0:
+        if int(boss["hp"]) <= 0:
+            boss_defeated = True
+        else:
+            bdmg, bcrit = roll_boss_hit()
+            current_pet_hp = max(0, current_pet_hp - bdmg)
+            boss["pet_hp"][pet_id] = current_pet_hp
+            logs.append(
+                f"💢 {boss['name']} {'暴击！' if bcrit else ''}反击 {pet['name']}，"
+                f"造成 {bdmg} 点伤害，{pet['name']} 剩余 {current_pet_hp}/{pet_max} HP。"
+            )
+            if current_pet_hp <= 0:
+                pet_defeated = True
+    else:
+        bdmg, bcrit = roll_boss_hit()
+        current_pet_hp = max(0, current_pet_hp - bdmg)
+        boss["pet_hp"][pet_id] = current_pet_hp
+        logs.append(
+            f"💢 {boss['name']} {'暴击！' if bcrit else ''}先手攻击 {pet['name']}，"
+            f"造成 {bdmg} 点伤害，{pet['name']} 剩余 {current_pet_hp}/{pet_max} HP。"
+        )
+        if current_pet_hp <= 0:
+            pet_defeated = True
+        else:
+            dmg, crit = roll_pet_hit()
+            pet_dealt = dmg
+            boss["hp"] = max(0, int(boss["hp"]) - dmg)
+            logs.append(f"🗡 {pet['name']} {'暴击！' if crit else ''}反击 {boss['name']}，造成 {dmg} 点伤害。")
+            if int(boss["hp"]) <= 0:
+                boss_defeated = True
+
+    if pet_dealt > 0:
+        boss["participants"].add(user_id)
+        boss["damage"][user_id] = int(boss["damage"].get(user_id, 0)) + pet_dealt
+
+    if pet_defeated:
+        boss["defeated_pets"].add(pet_id)
+        logs.append(f"💀 {pet['name']} 倒下了！本次 Boss 战不能再上场，请用 /切换宠物 更换。")
+
+    if boss_defeated:
+        boss_name = boss["name"]
+        boss_level = boss["level"]
+        participants = boss["participants"]
+        damage_board = boss["damage"]
         active_group_bosses.pop(int(event.group_id), None)
         reward_text = build_boss_reward_text(participants)
-        await boss_attack_cmd.finish(
-            reply_message(
-                event,
-                f"{pet['name']} {crit_text}造成 {damage} 点伤害，{boss['name']} 倒下了！\n{reward_text}",
-            )
-        )
 
-    await boss_attack_cmd.finish(
-        reply_message(
-            event,
-            f"{pet['name']} {crit_text}造成 {damage} 点伤害。\n"
-            f"{boss['name']} 剩余血量: {boss['hp']}/{boss['max_hp']}",
-        )
-    )
+        sorted_damage = sorted(damage_board.items(), key=lambda x: x[1], reverse=True)
+        intro = "\n".join(logs) + f"\n\n{boss_name}（Lv.{boss_level}） 被击败了！\n{reward_text}\n===伤害排行===\n"
+        msg = reply_message(event, intro)
+        for rank, (uid, dmg) in enumerate(sorted_damage, 1):
+            msg = msg + MessageSegment.text(f"  第{rank}名 ") + MessageSegment.at(uid) + MessageSegment.text(f" {dmg}点\n")
+        await boss_attack_cmd.finish(msg)
+
+    logs.append(f"📊 {boss['name']}（Lv.{boss['level']}） 剩余血量: {boss['hp']}/{boss['max_hp']}")
+    await boss_attack_cmd.finish(reply_message(event, "\n".join(logs)))
 
 
 battle_challenge_cmd = on_command("发起对战", priority=4, block=True)
@@ -727,22 +835,32 @@ async def handle_battle_accept(event: MessageEvent):
     pending_battles.pop(int(event.group_id), None)
     challenger_id = int(challenge["challenger_id"])
     defender_id = int(challenge["defender_id"])
+
+    challenger_is_new = get_current_pet(challenger_id) is None
+    defender_is_new = get_current_pet(defender_id) is None
+
     winner_id, logs = simulate_pet_battle(challenger_id, defender_id)
     loser_id = defender_id if winner_id == challenger_id else challenger_id
     winner_pet, winner_leveled = add_pet_reward(winner_id, BATTLE_REWARD_EXP, BATTLE_WIN_AFFECTION)
     loser_pet = add_pet_affection(loser_id, BATTLE_LOSE_AFFECTION)
 
     level_text = f"，升级 {winner_leveled} 级" if winner_leveled > 0 else ""
-    await battle_accept_cmd.finish(
-        reply_message(
-            event,
-            "\n".join(logs)
-            + "\n"
-            + f"胜者: {winner_id} 的 {winner_pet['name']}，获得 {BATTLE_REWARD_EXP} 经验"
-            + f"和 {BATTLE_WIN_AFFECTION} 好感度{level_text}。\n"
-            + f"败者: {loser_id} 的 {loser_pet['name']} 失去 {abs(BATTLE_LOSE_AFFECTION)} 好感度。",
-        )
+    result_text = (
+        "\n".join(logs)
+        + "\n"
+        + f"胜者: {winner_id} 的 {winner_pet['name']}，获得 {BATTLE_REWARD_EXP} 经验"
+        + f"和 {BATTLE_WIN_AFFECTION} 好感度{level_text}。\n"
+        + f"败者: {loser_id} 的 {loser_pet['name']} 失去 {abs(BATTLE_LOSE_AFFECTION)} 好感度。"
     )
+    msg = reply_message(event, result_text)
+
+    new_pet_users = [uid for uid, is_new in [(challenger_id, challenger_is_new), (defender_id, defender_is_new)] if is_new]
+    if new_pet_users:
+        msg = msg + Message("\n[系统提示] ")
+        for uid in new_pet_users:
+            msg = msg + MessageSegment.at(uid) + Message(" 从未使用过宠物功能，已随机分配初始宠物参与本次对战。")
+
+    await battle_accept_cmd.finish(msg)
 
 
 enable_broadcast_cmd = on_command("开启播报", priority=4, block=True)

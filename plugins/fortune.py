@@ -2,7 +2,8 @@ import random
 
 from datetime import date
 from nonebot import on_command
-from nonebot.adapters.onebot.v11 import PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import MessageEvent
+from .message_utils import reply_message
 
 fortune_cmd = on_command("今日运势", aliases={"运势", "运气"}, priority=5, block=True)
 
@@ -63,7 +64,7 @@ BAD_ITEMS = [
 ]
 
 @fortune_cmd.handle()
-async def handle_fortune(event: PrivateMessageEvent):
+async def handle_fortune(event: MessageEvent):
     # 用日期+用户id做种，同一天结果一致
     seed = int(str(date.today()).replace("-", "")) + event.user_id
     rng = random.Random(seed)
@@ -110,4 +111,4 @@ async def handle_fortune(event: PrivateMessageEvent):
 
 ——OW掐指一算，今日卦象已定"""
 
-    await fortune_cmd.finish(msg)
+    await fortune_cmd.finish(reply_message(event, msg))
