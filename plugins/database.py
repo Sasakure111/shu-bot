@@ -90,6 +90,23 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                remind_at TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reminders_user
+            ON reminders (user_id, remind_at)
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS pet_types (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -132,6 +149,7 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "users", "last_battle_challenge_at", "TEXT")
+        _ensure_column(conn, "users", "chat_mode", "TEXT NOT NULL DEFAULT 'deep'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS daily_checkin (
@@ -317,6 +335,62 @@ def load_recent_chat_history(user_id: int, limit: int) -> list[dict[str, str]]:
         {"role": row["role"], "content": row["content"]}
         for row in reversed(rows)
     ]
+
+
+def clear_chat_history(user_id: int) -> int:
+    try:
+        with _connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM chat_messages
+                WHERE user_id = ?
+                """,
+                (int(user_id),),
+            )
+            return int(cursor.rowcount)
+    except sqlite3.Error as exc:
+        print(f"[DB] 清空聊天记录失败: {type(exc).__name__}: {exc}")
+        return 0
+
+
+def get_user_chat_mode(user_id: int, default: str = "deep") -> str:
+    ensure_user(user_id)
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                """
+                SELECT chat_mode
+                FROM users
+                WHERE user_id = ?
+                """,
+                (int(user_id),),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        print(f"[DB] 读取聊天模式失败: {type(exc).__name__}: {exc}")
+        return default
+
+    if row is None or row["chat_mode"] not in ("casual", "deep"):
+        return default
+    return row["chat_mode"]
+
+
+def set_user_chat_mode(user_id: int, chat_mode: str) -> None:
+    if chat_mode not in ("casual", "deep"):
+        chat_mode = "deep"
+
+    ensure_user(user_id)
+    try:
+        with _connect() as conn:
+            conn.execute(
+                """
+                UPDATE users
+                SET chat_mode = ?
+                WHERE user_id = ?
+                """,
+                (chat_mode, int(user_id)),
+            )
+    except sqlite3.Error as exc:
+        print(f"[DB] 保存聊天模式失败: {type(exc).__name__}: {exc}")
 
 
 def get_random_pet_type() -> sqlite3.Row:
@@ -517,6 +591,57 @@ def switch_current_pet(user_id: int, pet_id: int) -> sqlite3.Row | None:
         return pet
 
 
+def release_pet(user_id: int, pet_id: int) -> sqlite3.Row | None:
+    """弃养（删除）属于该用户的指定宠物。
+
+    返回被删除宠物的信息（含 name/rarity/level）；找不到或不属于该用户时返回 None。
+    若删掉的是当前携带宠物，自动改携带仓库里剩余 id 最小的一只；没有剩余则置空，
+    下次任意宠物指令会经 ensure_current_pet 重新领取初始宠物。
+    """
+    ensure_user(user_id)
+    with _connect() as conn:
+        pet = conn.execute(
+            """
+            SELECT
+                pets.id,
+                pets.owner_user_id,
+                pets.level,
+                pet_types.name,
+                pet_types.rarity
+            FROM pets
+            JOIN pet_types ON pet_types.id = pets.type_id
+            WHERE pets.owner_user_id = ? AND pets.id = ?
+            """,
+            (int(user_id), int(pet_id)),
+        ).fetchone()
+        if pet is None:
+            return None
+
+        user_row = conn.execute(
+            "SELECT current_pet_id FROM users WHERE user_id = ?",
+            (int(user_id),),
+        ).fetchone()
+        is_current = (
+            user_row is not None
+            and user_row["current_pet_id"] is not None
+            and int(user_row["current_pet_id"]) == int(pet_id)
+        )
+
+        conn.execute("DELETE FROM pets WHERE id = ?", (int(pet_id),))
+
+        if is_current:
+            replacement = conn.execute(
+                "SELECT id FROM pets WHERE owner_user_id = ? ORDER BY id LIMIT 1",
+                (int(user_id),),
+            ).fetchone()
+            new_current = int(replacement["id"]) if replacement is not None else None
+            conn.execute(
+                "UPDATE users SET current_pet_id = ? WHERE user_id = ?",
+                (new_current, int(user_id)),
+            )
+        return pet
+
+
 def ensure_current_pet(user_id: int) -> sqlite3.Row:
     pet = get_current_pet(user_id)
     if pet is not None:
@@ -536,8 +661,36 @@ def exp_to_next_level(pet: sqlite3.Row) -> int | None:
     return int(pet["upgrade_exp"]) * int(pet["level"])
 
 
-def add_pet_exp(user_id: int, amount: int) -> tuple[sqlite3.Row, int]:
-    pet = ensure_current_pet(user_id)
+def get_pet_by_id(pet_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT
+                pets.id,
+                pets.owner_user_id,
+                pets.type_id,
+                pets.level,
+                pets.exp,
+                pets.hp,
+                pets.attack,
+                pets.speed,
+                pets.affection,
+                pet_types.name,
+                pet_types.rarity,
+                pet_types.upgrade_exp
+            FROM pets
+            JOIN pet_types ON pet_types.id = pets.type_id
+            WHERE pets.id = ?
+            """,
+            (int(pet_id),),
+        ).fetchone()
+
+
+def add_pet_exp_to(pet_id: int, amount: int) -> tuple[sqlite3.Row | None, int]:
+    """给指定宠物加经验（按 pet_id，不依赖"当前携带"），返回 (宠物, 升级数)。"""
+    pet = get_pet_by_id(pet_id)
+    if pet is None:
+        return None, 0
     level = int(pet["level"])
     exp = int(pet["exp"]) + int(amount)
     leveled = 0
@@ -561,14 +714,14 @@ def add_pet_exp(user_id: int, amount: int) -> tuple[sqlite3.Row, int]:
             SET level = ?, exp = ?
             WHERE id = ?
             """,
-            (level, exp, int(pet["id"])),
+            (level, exp, int(pet_id)),
         )
 
-    return ensure_current_pet(user_id), leveled
+    return get_pet_by_id(pet_id), leveled
 
 
-def add_pet_affection(user_id: int, amount: int) -> sqlite3.Row:
-    pet = ensure_current_pet(user_id)
+def add_pet_affection_to(pet_id: int, amount: int) -> sqlite3.Row | None:
+    """给指定宠物加好感（按 pet_id）。"""
     with _connect() as conn:
         conn.execute(
             """
@@ -576,9 +729,25 @@ def add_pet_affection(user_id: int, amount: int) -> sqlite3.Row:
             SET affection = MIN(?, MAX(0, affection + ?))
             WHERE id = ?
             """,
-            (MAX_PET_AFFECTION, int(amount), int(pet["id"])),
+            (MAX_PET_AFFECTION, int(amount), int(pet_id)),
         )
-    return ensure_current_pet(user_id)
+    return get_pet_by_id(pet_id)
+
+
+def add_pet_reward_to(pet_id: int, exp_amount: int, affection_amount: int) -> tuple[sqlite3.Row | None, int]:
+    """给指定宠物同时加经验和好感（按 pet_id）。"""
+    _, leveled = add_pet_exp_to(pet_id, exp_amount)
+    return add_pet_affection_to(pet_id, affection_amount), leveled
+
+
+def add_pet_exp(user_id: int, amount: int) -> tuple[sqlite3.Row, int]:
+    pet = ensure_current_pet(user_id)
+    return add_pet_exp_to(int(pet["id"]), amount)
+
+
+def add_pet_affection(user_id: int, amount: int) -> sqlite3.Row:
+    pet = ensure_current_pet(user_id)
+    return add_pet_affection_to(int(pet["id"]), amount)
 
 
 def add_pet_reward(user_id: int, exp_amount: int, affection_amount: int) -> tuple[sqlite3.Row, int]:
@@ -699,6 +868,63 @@ def get_enabled_broadcast_targets() -> list[sqlite3.Row]:
             WHERE enabled = 1
             """
         ).fetchall()
+
+
+def add_reminder(user_id: int, remind_at: str, content: str) -> int:
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO reminders (user_id, remind_at, content)
+            VALUES (?, ?, ?)
+            """,
+            (int(user_id), remind_at, content),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_reminder(reminder_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, remind_at, content
+            FROM reminders
+            WHERE id = ?
+            """,
+            (int(reminder_id),),
+        ).fetchone()
+
+
+def list_user_reminders(user_id: int) -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, remind_at, content
+            FROM reminders
+            WHERE user_id = ?
+            ORDER BY remind_at
+            """,
+            (int(user_id),),
+        ).fetchall()
+
+
+def list_all_reminders() -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, remind_at, content
+            FROM reminders
+            ORDER BY remind_at
+            """
+        ).fetchall()
+
+
+def delete_reminder(reminder_id: int) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM reminders WHERE id = ?",
+            (int(reminder_id),),
+        )
+        return cursor.rowcount > 0
 
 
 def _to_json(data: object, default: object) -> str:

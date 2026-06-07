@@ -2,7 +2,7 @@ import random
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 from nonebot import on_command, on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageEvent, PrivateMessageEvent
 from nonebot.params import CommandArg
@@ -18,7 +18,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env.prod")
 # 如果你 echo.py 里 client 是模块级变量,直接 import 过来
 #from .echo import client
 
-client = OpenAI(
+client = AsyncOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_BASE_URL"),
 )
@@ -89,7 +89,7 @@ async def _build_tarot_reply(user_id: int, question: str, save_history: bool) ->
 - 偶尔可以用一两个颜文字,但不要过度
 - 不要过度承诺好结果或恐吓坏结果"""
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model="deepseek-chat",
         messages=[
             {"role": "system", "content": "你是一位塔罗占卜师,擅长结合具体问题给出有启发性的解读。"},
@@ -108,10 +108,10 @@ async def _build_tarot_reply(user_id: int, question: str, save_history: bool) ->
         }
         assistant_history_message = {"role": "assistant", "content": full_reply}
 
-        history = chat_history.setdefault(
-            user_id,
-            load_recent_chat_history(user_id, MAX_HISTORY_TURNS * 2),
-        )
+        # 仅在内存未缓存时才查库；setdefault 会每次都先把默认值算出来，等于每次都查一次 DB
+        if user_id not in chat_history:
+            chat_history[user_id] = load_recent_chat_history(user_id, MAX_HISTORY_TURNS * 2)
+        history = chat_history[user_id]
         history.append(user_history_message)
         history.append(assistant_history_message)
         add_chat_messages(user_id, [user_history_message, assistant_history_message])

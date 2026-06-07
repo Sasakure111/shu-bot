@@ -1,0 +1,1052 @@
+"""Static content tables for the fantasy roguelike RPG."""
+
+from __future__ import annotations
+
+from .rpg_models import (
+    BossTemplate,
+    ChapterDefinition,
+    ClassTemplate,
+    EnemyRankProfile,
+    EnemyTemplate,
+    ItemTemplate,
+    SkillTemplate,
+    UnitStatProfile,
+)
+
+
+MAX_PLAYER_LEVEL = 10
+MAX_MP = 100
+MAX_SPD = 20
+MAX_COMBO_HITS = 2  # 单次行动后最多追加的连击次数（每次按 combo_rate 重新判定）
+RANDOM_STAT_MIN = 0
+RANDOM_STAT_MAX = 20
+STARTING_GOLD = 0
+STARTING_INVENTORY = ["small_potion", "mana_drop"]
+LEVEL_EXP_BASE = 15
+LEVEL_EXP_PER_LEVEL = 5
+
+# 背包 / 装备规则
+MAX_BACKPACK_SLOTS = 10  # 背包格子上限（穿戴的装备不占用）
+MAX_EQUIPPED = 2  # 同时穿戴的装备上限
+MAX_STACK = 99  # 单格普通消耗品的叠加上限
+
+# 道具按 type 字段分三类：
+#   equipment 装备   —— 穿戴占装备栏、永久改属性、同名只能持 1 个
+#   attribute 属性道具 —— 持有即生效、可叠效果、不可叠到同格、可持有多个
+#   consumable 消耗品 —— 其余一切，可叠加到 MAX_STACK
+EQUIPMENT_TYPES = {"weapon", "armor"}
+ATTRIBUTE_TYPES = {"trinket"}
+
+# 职业基础数值来自《数值设定》文档。
+#   属性公式：stat = base + growth × (Lv - 1)；职业 SPD 为固定值（growth.spd = 0）。
+#   base_resist/base_crit 为基础抗性%/基础暴击%，参与总抗性、总暴击计算。
+STANDARD_CLASSES: list[ClassTemplate] = [
+    {
+        "id": "warrior",
+        "name": "战士",
+        "description": "可靠的前排武者，擅长承伤和稳定物理输出。",
+        "base": {"hp": 120, "atk": 35, "def": 25, "mat": 0, "mdf": 25, "mp": 20, "spd": 8},
+        "growth": {"hp": 30, "atk": 8, "def": 6, "mat": 0, "mdf": 6, "mp": 5, "spd": 0},
+        "base_resist": 10,
+        "base_crit": 5,
+        "starting_skills": ["warrior_placeholder"],
+    },
+    {
+        "id": "mage",
+        "name": "法师",
+        "description": "以魔力撕开战局的施法者，爆发很高但身板脆弱。",
+        "base": {"hp": 90, "atk": 10, "def": 18, "mat": 37, "mdf": 23, "mp": 40, "spd": 9},
+        "growth": {"hp": 25, "atk": 4, "def": 4, "mat": 9, "mdf": 7, "mp": 5, "spd": 0},
+        "base_resist": 8,
+        "base_crit": 5,
+        "starting_skills": ["mage_placeholder"],
+    },
+    {
+        "id": "ranger",
+        "name": "游侠",
+        "description": "行动灵活的远行者，速度和稳定输出都很优秀。",
+        "base": {"hp": 110, "atk": 35, "def": 22, "mat": 5, "mdf": 20, "mp": 20, "spd": 13},
+        "growth": {"hp": 28, "atk": 9, "def": 6, "mat": 3, "mdf": 6, "mp": 5, "spd": 0},
+        "base_resist": 8,
+        "base_crit": 5,
+        "starting_skills": ["ranger_placeholder"],
+    },
+    {
+        "id": "cleric",
+        "name": "牧师",
+        "description": "兼具恢复与圣术的支援者，续航能力出色。",
+        "base": {"hp": 125, "atk": 5, "def": 20, "mat": 20, "mdf": 30, "mp": 30, "spd": 7},
+        "growth": {"hp": 30, "atk": 3, "def": 5, "mat": 5, "mdf": 6, "mp": 5, "spd": 0},
+        "base_resist": 15,
+        "base_crit": 0,
+        "heal_multiplier": 2.0,  # 特殊：治疗加成 100%（治疗量为基础的 200%）
+        "starting_skills": ["cleric_placeholder"],
+    },
+    {
+        "id": "rogue",
+        "name": "盗贼",
+        "description": "轻装高速的机会主义者，擅长暴击和闪避。",
+        "base": {"hp": 100, "atk": 28, "def": 20, "mat": 7, "mdf": 18, "mp": 20, "spd": 15},
+        "growth": {"hp": 25, "atk": 8, "def": 5, "mat": 3, "mdf": 5, "mp": 5, "spd": 0},
+        "base_resist": 5,
+        "base_crit": 10,
+        "starting_skills": ["rogue_placeholder"],
+    },
+    {
+        "id": "bard",
+        "name": "吟游诗人",
+        "description": "用音乐、话术与魔法牵动局势的全能辅助。",
+        "base": {"hp": 110, "atk": 15, "def": 20, "mat": 28, "mdf": 22, "mp": 25, "spd": 10},
+        "growth": {"hp": 25, "atk": 5, "def": 4, "mat": 7, "mdf": 6, "mp": 5, "spd": 0},
+        "base_resist": 10,
+        "base_crit": 5,
+        "charm_bonus": 5,  # 特殊：魅力 +5，可突破上限
+        "starting_skills": ["bard_placeholder"],
+    },
+]
+
+PLACEHOLDER_CLASS_SKILLS: list[SkillTemplate] = [
+    {
+        "id": "warrior_placeholder",
+        "name": "战士占位技",
+        "type": "physical",
+        "mp_cost": 1,
+        "power": 1.0,
+        "description": "战士专属技能池占位，造成 1.0 倍物理伤害。",
+    },
+    {
+        "id": "mage_placeholder",
+        "name": "法师占位技",
+        "type": "magical",
+        "mp_cost": 1,
+        "power": 1.0,
+        "description": "法师专属技能池占位，造成 1.0 倍魔法伤害。",
+    },
+    {
+        "id": "ranger_placeholder",
+        "name": "游侠占位技",
+        "type": "physical",
+        "mp_cost": 1,
+        "power": 1.0,
+        "description": "游侠专属技能池占位，造成 1.0 倍物理伤害。",
+    },
+    {
+        "id": "cleric_placeholder",
+        "name": "牧师占位技",
+        "type": "magical",
+        "mp_cost": 1,
+        "power": 1.0,
+        "description": "牧师专属技能池占位，造成 1.0 倍魔法伤害。",
+    },
+    {
+        "id": "rogue_placeholder",
+        "name": "盗贼占位技",
+        "type": "physical",
+        "mp_cost": 1,
+        "power": 1.0,
+        "description": "盗贼专属技能池占位，造成 1.0 倍物理伤害。",
+    },
+    {
+        "id": "bard_placeholder",
+        "name": "吟游诗人占位技",
+        "type": "magical",
+        "mp_cost": 1,
+        "power": 1.0,
+        "description": "吟游诗人专属技能池占位，造成 1.0 倍魔法伤害。",
+    },
+]
+
+BASE_SKILLS: list[SkillTemplate] = PLACEHOLDER_CLASS_SKILLS + [
+    {
+        "id": "heavy_slash",
+        "name": "重击",
+        "type": "physical",
+        "mp_cost": 8,
+        "power": 1.8,
+        "description": "造成较高物理伤害，有小概率附加麻痹。",
+        "status": "paralysis",
+        "status_chance": 25,
+    },
+    {
+        "id": "guard_stance",
+        "name": "守势",
+        "type": "support",
+        "mp_cost": 10,
+        "power": 0.0,
+        "description": "本场战斗临时提高防御，适合拖入消耗战。",
+    },
+    {
+        "id": "fireball",
+        "name": "火球术",
+        "type": "magical",
+        "mp_cost": 18,
+        "power": 2.0,
+        "description": "造成高额魔法伤害，有概率燃烧。",
+        "status": "burn",
+        "status_chance": 50,
+    },
+    {
+        "id": "arcane_focus",
+        "name": "奥术专注",
+        "type": "support",
+        "mp_cost": 12,
+        "power": 0.0,
+        "description": "提升下一次魔法技能的稳定性。",
+    },
+    {
+        "id": "double_shot",
+        "name": "连射",
+        "type": "physical",
+        "mp_cost": 10,
+        "power": 1.35,
+        "description": "连续射击两次，单段伤害较低。",
+    },
+    {
+        "id": "hunters_mark",
+        "name": "猎手标记",
+        "type": "support",
+        "mp_cost": 8,
+        "power": 0.0,
+        "description": "标记目标，使后续物理伤害更可靠。",
+    },
+    {
+        "id": "smite",
+        "name": "惩戒",
+        "type": "magical",
+        "mp_cost": 14,
+        "power": 1.6,
+        "description": "造成圣术伤害，对诅咒类敌人更有效。",
+    },
+    {
+        "id": "minor_heal",
+        "name": "小治愈术",
+        "type": "support",
+        "mp_cost": 16,
+        "power": 1.5,
+        "description": "回复自身生命值，回复量与魔攻相关。",
+    },
+    {
+        "id": "backstab",
+        "name": "背刺",
+        "type": "physical",
+        "mp_cost": 9,
+        "power": 1.55,
+        "description": "高速突袭，暴击时收益更高。",
+    },
+    {
+        "id": "smoke_step",
+        "name": "烟步",
+        "type": "support",
+        "mp_cost": 10,
+        "power": 0.0,
+        "description": "提高闪避并尝试脱离危险。",
+    },
+    {
+        "id": "cutting_chord",
+        "name": "断弦音",
+        "type": "magical",
+        "mp_cost": 12,
+        "power": 1.35,
+        "description": "造成魔法伤害，并有概率削弱敌方攻击。",
+        "status": "curse",
+        "status_chance": 35,
+    },
+    {
+        "id": "inspiring_song",
+        "name": "激励之歌",
+        "type": "support",
+        "mp_cost": 15,
+        "power": 0.0,
+        "description": "短暂提升自身攻防，魅力较高时效果更好。",
+    },
+]
+
+# 状态定义。状态伤害公式来自《数值设定》，但文档未给各状态的“基础值/持续回合”，
+# 以下为合理默认：kind=damage 走 status_damage 公式逐回合扣血；kind=stun 跳过该回合行动。
+# 状态定义（来自状态设计表）。字段说明：
+#   base_value 状态伤害基础值（0=无DOT）；duration 持续回合；max_stacks 最大叠层（1=不可叠）；
+#   skip_action 跳过行动；atk_mat_mult 持续期 ATK/MAT 乘子；spd_penalty_per_stack 每层攻速惩罚；
+#   wake_on_hit 受击解除概率%；vuln_type/vuln_mult 受指定类型攻击的增伤；
+#   cleansed_by/cleanse_extra_mult 被指定类型攻击解除并附带增伤（无对应攻击类型时不触发）。
+STATUS_DEFINITIONS: dict[str, dict[str, object]] = {
+    "poison": {"name": "中毒", "base_value": 20, "duration": 3, "max_stacks": 2},
+    "burn": {"name": "燃烧", "base_value": 35, "duration": 2, "max_stacks": 1, "cleansed_by": "ice", "cleanse_extra_mult": 0.2},
+    "freeze": {"name": "冰冻", "base_value": 0, "duration": 1, "max_stacks": 1, "skip_action": True, "vuln_type": "physical", "vuln_mult": 0.5},
+    "sleep": {"name": "昏睡", "base_value": 0, "duration": 2, "max_stacks": 1, "skip_action": True, "wake_on_hit": 50},
+    "curse": {"name": "诅咒", "base_value": 10, "duration": 4, "max_stacks": 1, "atk_mat_mult": 0.75},
+    "paralysis": {"name": "麻痹", "base_value": 5, "duration": 3, "max_stacks": 2, "spd_penalty_per_stack": 10},
+}
+
+# 负面状态集合（清除负面状态类道具据此判断；buff 类增益不在其中）。
+NEGATIVE_STATUS_IDS = {"poison", "burn", "freeze", "sleep", "curse", "paralysis"}
+
+ITEM_QUALITY_BASE_PRICES = {
+    "trash": 5,
+    "common": 15,
+    "practical": 35,
+    "rare": 60,
+    "uncommon": 80,
+    "legendary": 100,
+    "special": 0,
+}
+
+ITEM_QUALITY_NAMES = {
+    "trash": "垃圾",
+    "common": "普通",
+    "practical": "实用",
+    "rare": "稀有",
+    "uncommon": "罕见",
+    "legendary": "传奇",
+    "special": "特殊",
+}
+
+ITEM_POOLS: list[ItemTemplate] = [
+    {
+        "id": "cracked_pebble",
+        "name": "裂纹石子",
+        "type": "material",
+        "quality": "trash",
+        "price": 5,
+        "description": "看起来没什么用，但也许能卖一点钱。",
+        "effects": {},
+    },
+    {
+        "id": "small_potion",
+        "name": "小型治疗药水",
+        "type": "potion",
+        "quality": "common",
+        "price": 35,
+        "description": "回复 45 点 HP。",
+        "effects": {"heal_hp": 45},
+    },
+    {
+        "id": "mana_drop",
+        "name": "凝魔露",
+        "type": "potion",
+        "quality": "common",
+        "price": 40,
+        "description": "回复 25 点 MP。",
+        "effects": {"heal_mp": 25},
+    },
+    {
+        "id": "field_ration",
+        "name": "旅行干粮",
+        "type": "food",
+        "quality": "common",
+        "price": 25,
+        "description": "回复少量 HP 和 MP。",
+        "effects": {"heal_hp": 20, "heal_mp": 10},
+    },
+    # ============ 武器（装备栏，穿戴永久改属性） ============
+    {"id": "rusty_sword", "name": "生锈的短剑", "type": "weapon", "quality": "trash", "price": 5, "description": "ATK+5。", "effects": {"atk": 5}},
+    {"id": "crooked_broom", "name": "歪把扫帚", "type": "weapon", "quality": "trash", "price": 4, "description": "MAT+4。", "effects": {"mat": 4}},
+    {"id": "iron_sword", "name": "铁剑", "type": "weapon", "quality": "common", "price": 14, "description": "ATK+15。", "effects": {"atk": 15}},
+    {"id": "apprentice_staff", "name": "学徒法杖", "type": "weapon", "quality": "common", "price": 14, "description": "MAT+15。", "effects": {"mat": 15}},
+    {"id": "light_bow", "name": "轻便短弓", "type": "weapon", "quality": "common", "price": 15, "description": "ATK+12，SPD+1。", "effects": {"atk": 12, "spd": 1}},
+    {"id": "fine_steel_sword", "name": "精钢长剑", "type": "weapon", "quality": "practical", "price": 30, "description": "ATK+30。", "effects": {"atk": 30}},
+    {"id": "rune_staff", "name": "符文法杖", "type": "weapon", "quality": "practical", "price": 33, "description": "MAT+30，MP+5。", "effects": {"mat": 30, "mp": 5}},
+    {"id": "swift_dagger", "name": "疾风短刀", "type": "weapon", "quality": "practical", "price": 28, "description": "ATK+20，SPD+3。", "effects": {"atk": 20, "spd": 3}},
+    {"id": "mithril_blade", "name": "秘银阔剑", "type": "weapon", "quality": "rare", "price": 55, "description": "ATK+50，暴击骰+3。", "effects": {"atk": 50, "crit": 3}},
+    {"id": "elemental_staff", "name": "元素法杖", "type": "weapon", "quality": "rare", "price": 58, "description": "MAT+50，MP+10。", "effects": {"mat": 50, "mp": 10}},
+    {"id": "shadow_dagger", "name": "暗影匕首", "type": "weapon", "quality": "rare", "price": 60, "description": "ATK+35，SPD+5，暴击骰+5。", "effects": {"atk": 35, "spd": 5, "crit": 5}},
+    {"id": "holy_sword", "name": "圣光之剑", "type": "weapon", "quality": "uncommon", "price": 82, "description": "ATK+80。", "effects": {"atk": 80}},
+    {"id": "grand_sage_staff", "name": "大贤者之杖", "type": "weapon", "quality": "uncommon", "price": 85, "description": "MAT+80，MP+20。", "effects": {"mat": 80, "mp": 20}},
+    {"id": "windgod_blades", "name": "风神双刃", "type": "weapon", "quality": "uncommon", "price": 78, "description": "ATK+60，SPD+8。", "effects": {"atk": 60, "spd": 8}},
+    {"id": "dragonslayer", "name": "屠龙巨剑", "type": "weapon", "quality": "legendary", "price": 100, "description": "ATK+120。", "effects": {"atk": 120}},
+    {"id": "worldtree_staff", "name": "世界树之杖", "type": "weapon", "quality": "legendary", "price": 100, "description": "MAT+120，MP+30。", "effects": {"mat": 120, "mp": 30}},
+    # ============ 护具（装备栏） ============
+    {"id": "wormwood_shield", "name": "虫蛀木盾", "type": "armor", "quality": "trash", "price": 5, "description": "DEF+5。", "effects": {"def": 5}},
+    {"id": "faded_cloth_armor", "name": "褪色布甲", "type": "armor", "quality": "trash", "price": 6, "description": "DEF+3，MDF+3。", "effects": {"def": 3, "mdf": 3}},
+    {"id": "leather_armor", "name": "皮甲", "type": "armor", "quality": "common", "price": 16, "description": "DEF+12，HP+30。", "effects": {"def": 12, "hp": 30}},
+    {"id": "chainmail", "name": "锁子甲", "type": "armor", "quality": "practical", "price": 32, "description": "DEF+25，HP+60。", "effects": {"def": 25, "hp": 60}},
+    {"id": "resist_cloak", "name": "魔抗斗篷", "type": "armor", "quality": "practical", "price": 35, "description": "MDF+25，抗性骰+2。", "effects": {"mdf": 25, "resist": 2}},
+    {"id": "dragonscale_cuirass", "name": "龙鳞胸甲", "type": "armor", "quality": "rare", "price": 62, "description": "DEF+45，MDF+20，HP+120。", "effects": {"def": 45, "mdf": 20, "hp": 120}},
+    {"id": "guardian_bulwark", "name": "守护者重盾", "type": "armor", "quality": "rare", "price": 52, "description": "DEF+55，HP+80，SPD-2。", "effects": {"def": 55, "hp": 80, "spd": -2}},
+    {"id": "undying_armor", "name": "不灭战甲", "type": "armor", "quality": "uncommon", "price": 88, "description": "DEF+70，MDF+30，HP+200。", "effects": {"def": 70, "mdf": 30, "hp": 200}},
+    {"id": "divine_aegis", "name": "神铸天盾", "type": "armor", "quality": "legendary", "price": 100, "description": "DEF+100，MDF+60，HP+300，抗性骰+5。", "effects": {"def": 100, "mdf": 60, "hp": 300, "resist": 5}},
+    # ============ 食物（消耗品，回 HP + 临时增益） ============
+    {"id": "hard_bread", "name": "干硬面包", "type": "food", "quality": "trash", "price": 3, "description": "回复 20 HP。", "effects": {"heal_hp": 20}},
+    {"id": "moldy_cheese", "name": "发霉奶酪", "type": "food", "quality": "trash", "price": 3, "description": "回复 30 HP，10% 概率中毒。", "effects": {"heal_hp": 30, "self_status": {"id": "poison", "chance": 10}}},
+    {"id": "raw_water", "name": "生水", "type": "food", "quality": "trash", "price": 4, "description": "回复 10 HP、5 MP。", "effects": {"heal_hp": 10, "heal_mp": 5}},
+    {"id": "meat_skewer", "name": "烤肉串", "type": "food", "quality": "common", "price": 10, "description": "回复 60 HP。", "effects": {"heal_hp": 60}},
+    {"id": "honey_bread", "name": "蜂蜜面包", "type": "food", "quality": "common", "price": 12, "description": "回复 40 HP、10 MP。", "effects": {"heal_hp": 40, "heal_mp": 10}},
+    {"id": "elf_fruit", "name": "精灵果实", "type": "food", "quality": "practical", "price": 28, "description": "回复 150 HP。", "effects": {"heal_hp": 150}},
+    {"id": "dragon_pepper", "name": "龙息辣椒", "type": "food", "quality": "practical", "price": 32, "description": "回复 80 HP，ATK+15 持续 3 回合。", "effects": {"heal_hp": 80, "buff": {"name": "龙息", "mods": {"atk": 15}, "duration": 3}}},
+    {"id": "hunter_grill", "name": "猎人烤鱼", "type": "food", "quality": "practical", "price": 30, "description": "回复 120 HP，SPD+2 持续 3 回合。", "effects": {"heal_hp": 120, "buff": {"name": "迅捷", "mods": {"spd": 2}, "duration": 3}}},
+    {"id": "royal_feast", "name": "皇家盛宴", "type": "food", "quality": "rare", "price": 50, "description": "回复 300 HP，ATK+20 持续 3 回合。", "effects": {"heal_hp": 300, "buff": {"name": "盛宴", "mods": {"atk": 20}, "duration": 3}}},
+    {"id": "star_wine", "name": "星辉果酒", "type": "food", "quality": "rare", "price": 55, "description": "回复 200 HP、15 MP，暴击骰+5 持续 3 回合。", "effects": {"heal_hp": 200, "heal_mp": 15, "buff": {"name": "星辉", "mods": {"crit": 5}, "duration": 3}}},
+    {"id": "phoenix_egg_dish", "name": "凤凰蛋料理", "type": "food", "quality": "uncommon", "price": 75, "description": "回复 500 HP，清除所有负面状态。", "effects": {"heal_hp": 500, "cleanse": "all"}},
+    {"id": "dragonheart_fruit", "name": "龙心果", "type": "food", "quality": "uncommon", "price": 80, "description": "回复 400 HP，全属性+10 持续 3 回合。", "effects": {"heal_hp": 400, "buff": {"name": "龙心", "mods": {"atk": 10, "def": 10, "mat": 10, "mdf": 10, "spd": 10}, "duration": 3}}},
+    {"id": "gods_feast", "name": "众神的晚宴", "type": "food", "quality": "legendary", "price": 100, "description": "回满 HP/MP，全属性+20 持续 3 回合，清除所有负面状态。", "effects": {"heal_full": True, "cleanse": "all", "buff": {"name": "神宴", "mods": {"atk": 20, "def": 20, "mat": 20, "mdf": 20, "spd": 20}, "duration": 3}}},
+    # ============ 药品（消耗品，回 MP + 解状态 + 临时防御） ============
+    {"id": "diluted_potion", "name": "稀释药水", "type": "potion", "quality": "trash", "price": 3, "description": "回复 5 MP。", "effects": {"heal_mp": 5}},
+    {"id": "herb_paste", "name": "草药糊", "type": "potion", "quality": "trash", "price": 5, "description": "随机解除 1 个负面状态。", "effects": {"cleanse": 1}},
+    {"id": "mana_potion", "name": "魔力药水", "type": "potion", "quality": "common", "price": 12, "description": "回复 15 MP。", "effects": {"heal_mp": 15}},
+    {"id": "antidote", "name": "解毒剂", "type": "potion", "quality": "common", "price": 10, "description": "解除中毒。", "effects": {"cleanse_ids": ["poison"]}},
+    {"id": "awakening_drug", "name": "清醒药", "type": "potion", "quality": "common", "price": 10, "description": "解除昏睡 / 麻痹。", "effects": {"cleanse_ids": ["sleep", "paralysis"]}},
+    {"id": "ironwall_potion", "name": "铁壁药剂", "type": "potion", "quality": "common", "price": 14, "description": "DEF+15 持续 3 回合。", "effects": {"buff": {"name": "铁壁", "mods": {"def": 15}, "duration": 3}}},
+    {"id": "high_mana_potion", "name": "高级魔力药水", "type": "potion", "quality": "practical", "price": 30, "description": "回复 30 MP。", "effects": {"heal_mp": 30}},
+    {"id": "panacea", "name": "万能解药", "type": "potion", "quality": "practical", "price": 35, "description": "解除所有负面状态。", "effects": {"cleanse": "all"}},
+    {"id": "magic_shield_potion", "name": "魔盾药剂", "type": "potion", "quality": "practical", "price": 32, "description": "MDF+25 持续 3 回合。", "effects": {"buff": {"name": "魔盾", "mods": {"mdf": 25}, "duration": 3}}},
+    {"id": "berserker_potion", "name": "狂战士药剂", "type": "potion", "quality": "practical", "price": 28, "description": "ATK+25、DEF-10 持续 3 回合。", "effects": {"buff": {"name": "狂战", "mods": {"atk": 25, "def": -10}, "duration": 3}}},
+    {"id": "arcane_essence", "name": "秘法精华", "type": "potion", "quality": "rare", "price": 55, "description": "回复 50 MP，MAT+20 持续 3 回合。", "effects": {"heal_mp": 50, "buff": {"name": "秘法", "mods": {"mat": 20}, "duration": 3}}},
+    {"id": "stoneskin_potion", "name": "石肤药剂", "type": "potion", "quality": "rare", "price": 52, "description": "DEF+40、MDF+20 持续 3 回合。", "effects": {"buff": {"name": "石肤", "mods": {"def": 40, "mdf": 20}, "duration": 3}}},
+    {"id": "phoenix_tears", "name": "不死鸟之泪", "type": "potion", "quality": "uncommon", "price": 88, "description": "回复 50% HP 和全部 MP，解除所有负面状态，抗性骰+5 持续 3 回合。", "effects": {"heal_hp_percent": 50, "heal_mp_percent": 100, "cleanse": "all", "buff": {"name": "不死鸟", "mods": {"resist": 5}, "duration": 3}}},
+    # ============ 属性道具（饰品，持有即生效、可叠、不消耗） ============
+    {"id": "cracked_amulet", "name": "碎裂的护身符", "type": "trinket", "quality": "trash", "price": 5, "description": "抗性骰+1。", "effects": {"resist": 1}},
+    {"id": "poor_whetstone", "name": "劣质磨刀石", "type": "trinket", "quality": "trash", "price": 5, "description": "暴击骰+1。", "effects": {"crit": 1}},
+    {"id": "lucky_coin", "name": "幸运硬币", "type": "trinket", "quality": "common", "price": 14, "description": "幸运+1。", "effects": {"luck": 1}},
+    {"id": "fine_whetstone", "name": "精磨刀石", "type": "trinket", "quality": "common", "price": 14, "description": "暴击骰+2。", "effects": {"crit": 2}},
+    {"id": "antimagic_herb", "name": "抗魔药草", "type": "trinket", "quality": "common", "price": 14, "description": "抗性骰+2。", "effects": {"resist": 2}},
+    {"id": "charm_perfume", "name": "魅力香水", "type": "trinket", "quality": "common", "price": 12, "description": "魅力+1。", "effects": {"charm": 1}},
+    {"id": "clover_pendant", "name": "四叶草吊坠", "type": "trinket", "quality": "practical", "price": 30, "description": "幸运+2。", "effects": {"luck": 2}},
+    {"id": "keen_eye", "name": "锐利之眼", "type": "trinket", "quality": "practical", "price": 30, "description": "暴击骰+3。", "effects": {"crit": 3}},
+    {"id": "exorcism_water", "name": "驱邪圣水", "type": "trinket", "quality": "practical", "price": 30, "description": "抗性骰+3。", "effects": {"resist": 3}},
+    {"id": "noble_emblem", "name": "贵族徽章", "type": "trinket", "quality": "practical", "price": 28, "description": "魅力+2。", "effects": {"charm": 2}},
+    {"id": "adventurer_manual", "name": "冒险者手册", "type": "trinket", "quality": "practical", "price": 33, "description": "幸运+1，暴击骰+1。", "effects": {"luck": 1, "crit": 1}},
+    {"id": "fate_dice", "name": "命运骰子", "type": "trinket", "quality": "rare", "price": 55, "description": "幸运+3。", "effects": {"luck": 3}},
+    {"id": "assassin_ring", "name": "刺客之戒", "type": "trinket", "quality": "rare", "price": 58, "description": "暴击骰+3，SPD+1。", "effects": {"crit": 3, "spd": 1}},
+    {"id": "paladin_medal", "name": "圣骑士勋章", "type": "trinket", "quality": "rare", "price": 52, "description": "抗性骰+4，魅力+1。", "effects": {"resist": 4, "charm": 1}},
+    {"id": "royal_seal", "name": "皇家印章", "type": "trinket", "quality": "rare", "price": 50, "description": "魅力+3。", "effects": {"charm": 3}},
+    {"id": "lucky_star", "name": "幸运之星", "type": "trinket", "quality": "uncommon", "price": 82, "description": "幸运+5。", "effects": {"luck": 5}},
+    {"id": "tyrant_crown", "name": "暴君战冠", "type": "trinket", "quality": "uncommon", "price": 85, "description": "暴击骰+5。", "effects": {"crit": 5}},
+    {"id": "dragonblood_chalice", "name": "龙血圣杯", "type": "trinket", "quality": "uncommon", "price": 78, "description": "抗性骰+8。", "effects": {"resist": 8}},
+    {"id": "mirror_of_hearts", "name": "人心之镜", "type": "trinket", "quality": "uncommon", "price": 80, "description": "魅力+5。", "effects": {"charm": 5}},
+    {"id": "heart_of_fate", "name": "命运之心", "type": "trinket", "quality": "legendary", "price": 100, "description": "幸运+10。", "effects": {"luck": 10}},
+    {"id": "crown_of_all", "name": "万象宝冠", "type": "trinket", "quality": "legendary", "price": 100, "description": "暴击骰+5，抗性骰+5，幸运+3，魅力+3。", "effects": {"crit": 5, "resist": 5, "luck": 3, "charm": 3}},
+    # ============ 职业偏向装备（不进商店，仅战斗/事件掉落；属性偏向对应职业，人人可穿）============
+    # —— 战士偏向（ATK/DEF/HP），复杂词条暂略 ——
+    {"id": "recruit_gauntlet", "name": "新兵的铁腕", "type": "weapon", "quality": "trash", "price": 8, "shop": False, "description": "[战士向] ATK+8，DEF+3。", "effects": {"atk": 8, "def": 3}},
+    {"id": "infantry_warhammer", "name": "步兵战锤", "type": "weapon", "quality": "common", "price": 18, "shop": False, "description": "[战士向] ATK+18，DEF+8，HP+20。", "effects": {"atk": 18, "def": 8, "hp": 20}},
+    {"id": "knight_broadsword", "name": "骑士阔剑", "type": "weapon", "quality": "practical", "price": 35, "shop": False, "description": "[战士向] ATK+35，DEF+15，HP+50。", "effects": {"atk": 35, "def": 15, "hp": 50}},
+    {"id": "lionheart_axe", "name": "狮心战斧", "type": "weapon", "quality": "rare", "price": 65, "shop": False, "description": "[战士向] ATK+55，DEF+25，HP+100。", "effects": {"atk": 55, "def": 25, "hp": 100}},
+    {"id": "conqueror_armor", "name": "征服者铠甲", "type": "armor", "quality": "uncommon", "price": 90, "shop": False, "description": "[战士向] ATK+40，DEF+65，HP+250。", "effects": {"atk": 40, "def": 65, "hp": 250}},
+    {"id": "wargod_plate", "name": "不屈之魂·战神铠", "type": "armor", "quality": "legendary", "price": 100, "shop": False, "description": "[战士向] ATK+100，DEF+80，HP+400。", "effects": {"atk": 100, "def": 80, "hp": 400}},
+    # —— 法师偏向（MAT/MP）——
+    {"id": "apprentice_shard", "name": "学徒的碎晶", "type": "weapon", "quality": "trash", "price": 8, "shop": False, "description": "[法师向] MAT+8，MP+3。", "effects": {"mat": 8, "mp": 3}},
+    {"id": "runeglyph_wand", "name": "咒纹短杖", "type": "weapon", "quality": "common", "price": 18, "shop": False, "description": "[法师向] MAT+18，MP+8。", "effects": {"mat": 18, "mp": 8}},
+    {"id": "element_orb", "name": "元素宝珠", "type": "weapon", "quality": "practical", "price": 35, "shop": False, "description": "[法师向] MAT+35，MP+12。", "effects": {"mat": 35, "mp": 12}},
+    {"id": "void_codex", "name": "虚空法典", "type": "weapon", "quality": "rare", "price": 65, "shop": False, "description": "[法师向] MAT+55，MP+18。", "effects": {"mat": 55, "mp": 18}},
+    {"id": "starfall_staff", "name": "星陨之杖", "type": "weapon", "quality": "uncommon", "price": 90, "shop": False, "description": "[法师向] MAT+85，MP+25。", "effects": {"mat": 85, "mp": 25}},
+    {"id": "annihilation_grimoire", "name": "禁咒之书·湮灭", "type": "weapon", "quality": "legendary", "price": 100, "shop": False, "description": "[法师向] MAT+130，MP+40。", "effects": {"mat": 130, "mp": 40}},
+    # —— 游侠偏向（ATK/SPD）——
+    {"id": "worn_shortbow", "name": "磨损的短弓", "type": "weapon", "quality": "trash", "price": 8, "shop": False, "description": "[游侠向] ATK+6，SPD+1。", "effects": {"atk": 6, "spd": 1}},
+    {"id": "hunter_longbow", "name": "猎人长弓", "type": "weapon", "quality": "common", "price": 18, "shop": False, "description": "[游侠向] ATK+15，SPD+2。", "effects": {"atk": 15, "spd": 2}},
+    {"id": "emerald_wind_bow", "name": "翠风之弓", "type": "weapon", "quality": "practical", "price": 35, "shop": False, "description": "[游侠向] ATK+28，SPD+4。", "effects": {"atk": 28, "spd": 4}},
+    {"id": "eagle_goggles", "name": "鹰眼护目镜", "type": "armor", "quality": "rare", "price": 65, "shop": False, "description": "[游侠向] ATK+45，SPD+5，暴击骰+4。", "effects": {"atk": 45, "spd": 5, "crit": 4}},
+    {"id": "windsong_bow", "name": "风语者之弓", "type": "weapon", "quality": "uncommon", "price": 90, "shop": False, "description": "[游侠向] ATK+70，SPD+8。", "effects": {"atk": 70, "spd": 8}},
+    {"id": "skyarrow_bow", "name": "苍穹猎弓·天矢", "type": "weapon", "quality": "legendary", "price": 100, "shop": False, "description": "[游侠向] ATK+100，SPD+12，暴击骰+8。", "effects": {"atk": 100, "spd": 12, "crit": 8}},
+    # —— 牧师偏向（MDF/HP）——
+    {"id": "prayer_beads", "name": "祈祷念珠", "type": "trinket", "quality": "trash", "price": 8, "shop": False, "description": "[牧师向] MDF+6，HP+15。", "effects": {"mdf": 6, "hp": 15}},
+    {"id": "holy_vestment", "name": "圣光法衣", "type": "armor", "quality": "common", "price": 18, "shop": False, "description": "[牧师向] MDF+12，HP+40。", "effects": {"mdf": 12, "hp": 40}},
+    {"id": "blessed_seal", "name": "祝福圣印", "type": "trinket", "quality": "practical", "price": 35, "shop": False, "description": "[牧师向] MDF+22，HP+80。", "effects": {"mdf": 22, "hp": 80}},
+    {"id": "martyr_shield", "name": "殉道者圣盾", "type": "armor", "quality": "rare", "price": 65, "shop": False, "description": "[牧师向] MDF+40，DEF+20，HP+150，抗性骰+3。", "effects": {"mdf": 40, "def": 20, "hp": 150, "resist": 3}},
+    {"id": "judgment_crown", "name": "圣裁之冠", "type": "armor", "quality": "uncommon", "price": 90, "shop": False, "description": "[牧师向] MDF+55，HP+200。", "effects": {"mdf": 55, "hp": 200}},
+    {"id": "redemption_scripture", "name": "天启圣典·救赎", "type": "trinket", "quality": "legendary", "price": 100, "shop": False, "description": "[牧师向] MDF+80，MAT+50，HP+350。", "effects": {"mdf": 80, "mat": 50, "hp": 350}},
+    # —— 盗贼偏向（ATK/SPD/暴击）——
+    {"id": "rusty_knife", "name": "生锈小刀", "type": "weapon", "quality": "trash", "price": 8, "shop": False, "description": "[盗贼向] ATK+5，SPD+2。", "effects": {"atk": 5, "spd": 2}},
+    {"id": "nightwalk_dagger", "name": "夜行短匕", "type": "weapon", "quality": "common", "price": 18, "shop": False, "description": "[盗贼向] ATK+12，SPD+3，暴击骰+1。", "effects": {"atk": 12, "spd": 3, "crit": 1}},
+    {"id": "viper_fang", "name": "毒蛇之牙", "type": "weapon", "quality": "practical", "price": 35, "shop": False, "description": "[盗贼向] ATK+25，SPD+4，暴击骰+3。", "effects": {"atk": 25, "spd": 4, "crit": 3}},
+    {"id": "assassin_gloves", "name": "暗杀者手套", "type": "armor", "quality": "rare", "price": 65, "shop": False, "description": "[盗贼向] ATK+40，SPD+6，暴击骰+5。", "effects": {"atk": 40, "spd": 6, "crit": 5}},
+    {"id": "shadowdance_cloak", "name": "影舞斗篷", "type": "armor", "quality": "uncommon", "price": 90, "shop": False, "description": "[盗贼向] ATK+60，SPD+9，暴击骰+7。", "effects": {"atk": 60, "spd": 9, "crit": 7}},
+    {"id": "deadly_shadow_blade", "name": "暗影之刃·致命", "type": "weapon", "quality": "legendary", "price": 100, "shop": False, "description": "[盗贼向] ATK+90，SPD+12，暴击骰+10。", "effects": {"atk": 90, "spd": 12, "crit": 10}},
+    # —— 吟游诗人偏向（魅力/MAT）——
+    {"id": "offkey_harmonica", "name": "走调的口琴", "type": "trinket", "quality": "trash", "price": 8, "shop": False, "description": "[诗人向] 魅力+2。", "effects": {"charm": 2}},
+    {"id": "traveler_harp", "name": "旅人的竖琴", "type": "weapon", "quality": "common", "price": 18, "shop": False, "description": "[诗人向] 魅力+3，MAT+10。", "effects": {"charm": 3, "mat": 10}},
+    {"id": "silver_lute", "name": "银弦琉特琴", "type": "weapon", "quality": "practical", "price": 35, "shop": False, "description": "[诗人向] 魅力+5，MAT+20。", "effects": {"charm": 5, "mat": 20}},
+    {"id": "siren_voice", "name": "塞壬之音", "type": "weapon", "quality": "rare", "price": 65, "shop": False, "description": "[诗人向] 魅力+7，MAT+35。", "effects": {"charm": 7, "mat": 35}},
+    {"id": "fate_symphony", "name": "命运交响曲", "type": "weapon", "quality": "uncommon", "price": 90, "shop": False, "description": "[诗人向] 魅力+10，MAT+55，幸运+3。", "effects": {"charm": 10, "mat": 55, "luck": 3}},
+    {"id": "genesis_requiem", "name": "创世诗篇·安魂曲", "type": "weapon", "quality": "legendary", "price": 100, "shop": False, "description": "[诗人向] 魅力+15，MAT+80，幸运+5。", "effects": {"charm": 15, "mat": 80, "luck": 5}},
+    {
+        "id": "dawn_treant_token",
+        "name": "黎明树卫纪念物",
+        "type": "keepsake",
+        "quality": "special",
+        "price": 0,
+        "description": "可带出局外的 Boss 纪念物。",
+        "effects": {"collection": "dawn_treant"},
+    },
+    {
+        "id": "storm_witch_token",
+        "name": "风暴女巫纪念物",
+        "type": "keepsake",
+        "quality": "special",
+        "price": 0,
+        "description": "可带出局外的 Boss 纪念物。",
+        "effects": {"collection": "storm_witch"},
+    },
+    {
+        "id": "rift_dragon_token",
+        "name": "裂隙幼龙纪念物",
+        "type": "keepsake",
+        "quality": "special",
+        "price": 0,
+        "description": "可带出局外的 Boss 纪念物。",
+        "effects": {"collection": "rift_dragon"},
+    },
+    {
+        "id": "adventure_certificate",
+        "name": "冒险证书",
+        "type": "certificate",
+        "quality": "special",
+        "price": 0,
+        "description": "终局 Boss 结局奖励，可带出局外收藏。",
+        "effects": {"ending_reward": "certificate"},
+    },
+]
+
+# 五个档位各有 A（物理倾向）/ B（法系倾向）两套显式基础属性，直接取自《数值设定》。
+#   实际怪物属性 = ENEMY_RANK_STATS[档位][变体]，按 base + growth ×(Lv-1) 计算；
+#   变体由敌人模板的 preferred_damage 决定：physical/mixed → A，magical → B。
+ENEMY_RANK_STATS: dict[str, dict[str, UnitStatProfile]] = {
+    "very_weak": {
+        "A": {  # 极弱怪A
+            "base": {"hp": 55, "atk": 20, "def": 13, "mat": 5, "mdf": 8, "mp": 15, "spd": 1},
+            "growth": {"hp": 15, "atk": 4, "def": 3, "mat": 3, "mdf": 3, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+        "B": {  # 极弱怪B
+            "base": {"hp": 55, "atk": 7, "def": 10, "mat": 22, "mdf": 15, "mp": 30, "spd": 1},
+            "growth": {"hp": 15, "atk": 3, "def": 3, "mat": 4, "mdf": 3, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+    },
+    "weak": {
+        "A": {  # 弱怪A
+            "base": {"hp": 65, "atk": 25, "def": 15, "mat": 8, "mdf": 12, "mp": 15, "spd": 4},
+            "growth": {"hp": 20, "atk": 5, "def": 4, "mat": 3, "mdf": 3, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+        "B": {  # 弱怪B
+            "base": {"hp": 65, "atk": 10, "def": 15, "mat": 28, "mdf": 20, "mp": 30, "spd": 4},
+            "growth": {"hp": 20, "atk": 3, "def": 5, "mat": 6, "mdf": 4, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+    },
+    "normal": {
+        "A": {  # 中等怪A
+            "base": {"hp": 80, "atk": 30, "def": 20, "mat": 10, "mdf": 15, "mp": 15, "spd": 6},
+            "growth": {"hp": 25, "atk": 7, "def": 5, "mat": 3, "mdf": 4, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+        "B": {  # 中等怪B
+            "base": {"hp": 80, "atk": 12, "def": 15, "mat": 32, "mdf": 22, "mp": 30, "spd": 6},
+            "growth": {"hp": 25, "atk": 3, "def": 5, "mat": 7, "mdf": 5, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+    },
+    "strong": {
+        "A": {  # 强怪A
+            "base": {"hp": 90, "atk": 32, "def": 25, "mat": 12, "mdf": 18, "mp": 15, "spd": 7},
+            "growth": {"hp": 28, "atk": 7, "def": 5, "mat": 3, "mdf": 5, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+        "B": {  # 强怪B
+            "base": {"hp": 90, "atk": 16, "def": 20, "mat": 35, "mdf": 25, "mp": 30, "spd": 7},
+            "growth": {"hp": 28, "atk": 3, "def": 5, "mat": 7, "mdf": 6, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+    },
+    "very_strong": {
+        "A": {  # 极强怪A
+            "base": {"hp": 100, "atk": 38, "def": 26, "mat": 15, "mdf": 20, "mp": 15, "spd": 8},
+            "growth": {"hp": 30, "atk": 7, "def": 6, "mat": 5, "mdf": 6, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+        "B": {  # 极强怪B
+            "base": {"hp": 100, "atk": 18, "def": 20, "mat": 37, "mdf": 28, "mp": 30, "spd": 8},
+            "growth": {"hp": 30, "atk": 4, "def": 5, "mat": 8, "mdf": 6, "mp": 5, "spd": 1},
+            "base_resist": 5,
+            "base_crit": 5,
+        },
+    },
+}
+
+# 档位的非属性参数（出手概率、奖励、掉落）；具体属性见 ENEMY_RANK_STATS。
+ENEMY_RANKS: dict[str, EnemyRankProfile] = {
+    "very_weak": {
+        "name": "极弱",
+        "skill_chance": 0,
+        "reward_multiplier": 0.55,
+        "exp_reward": 15,
+        "gold_reward": 5,
+        "drop_chance": 10,
+        "drop_quality_weights": {"trash": 100},
+    },
+    "weak": {
+        "name": "弱",
+        "skill_chance": 10,
+        "reward_multiplier": 0.75,
+        "exp_reward": 30,
+        "gold_reward": 10,
+        "drop_chance": 25,
+        "drop_quality_weights": {"common": 100},
+    },
+    "normal": {
+        "name": "中",
+        "skill_chance": 30,
+        "reward_multiplier": 1.0,
+        "exp_reward": 45,
+        "gold_reward": 20,
+        "drop_chance": 40,
+        "drop_quality_weights": {"common": 70, "practical": 30},
+    },
+    "strong": {
+        "name": "强",
+        "skill_chance": 70,
+        "reward_multiplier": 1.35,
+        "exp_reward": 60,
+        "gold_reward": 30,
+        "drop_chance": 60,
+        "drop_quality_weights": {"practical": 60, "rare": 40},
+    },
+    "very_strong": {
+        "name": "极强",
+        "skill_chance": 100,
+        "reward_multiplier": 1.8,
+        "exp_reward": 75,
+        "gold_reward": 50,
+        "drop_chance": 80,
+        "drop_quality_weights": {"rare": 65, "uncommon": 35},
+    },
+}
+
+ENEMY_RANK_WEIGHTS = {
+    "very_strong": 5,
+    "strong": 20,
+    "normal": 50,
+    "weak": 20,
+    "very_weak": 5,
+}
+
+# 敌人模板只保留外观与战斗倾向；具体属性按 档位 + preferred_damage 选取 ENEMY_RANK_STATS。
+ENEMY_TEMPLATES: list[EnemyTemplate] = [
+    {
+        "id": "goblin_scout",
+        "name": "林地斥候",
+        "chapter": 1,
+        "preferred_damage": "physical",
+        "skills": ["backstab"],
+    },
+    {
+        "id": "thorn_boar",
+        "name": "棘皮野猪",
+        "chapter": 1,
+        "preferred_damage": "physical",
+        "skills": ["heavy_slash"],
+    },
+    {
+        "id": "candle_imp",
+        "name": "烛焰小魔",
+        "chapter": 1,
+        "preferred_damage": "magical",
+        "skills": ["fireball"],
+    },
+    {
+        "id": "storm_raider",
+        "name": "风暴劫掠者",
+        "chapter": 2,
+        "preferred_damage": "physical",
+        "skills": ["double_shot", "smoke_step"],
+    },
+    {
+        "id": "mirror_adept",
+        "name": "镜塔术士",
+        "chapter": 2,
+        "preferred_damage": "magical",
+        "skills": ["fireball", "arcane_focus"],
+    },
+    {
+        "id": "grave_knight",
+        "name": "旧墓骑士",
+        "chapter": 2,
+        "preferred_damage": "mixed",
+        "skills": ["heavy_slash", "smite"],
+    },
+    {
+        "id": "void_hound",
+        "name": "裂隙猎犬",
+        "chapter": 3,
+        "preferred_damage": "physical",
+        "skills": ["backstab"],
+    },
+    {
+        "id": "starfallen_oracle",
+        "name": "坠星谕者",
+        "chapter": 3,
+        "preferred_damage": "magical",
+        "skills": ["cutting_chord", "smite"],
+    },
+    {
+        "id": "ruin_colossus",
+        "name": "遗迹巨像",
+        "chapter": 3,
+        "preferred_damage": "physical",
+        "skills": ["heavy_slash", "guard_stance"],
+    },
+]
+
+# Boss 共用一套基础属性（来自《数值设定》Boss 块），各 Boss 仅章节、等级、技能、机制、奖励不同。
+BOSS_STATS: UnitStatProfile = {
+    "base": {"hp": 150, "atk": 36, "def": 25, "mat": 36, "mdf": 25, "mp": 55, "spd": 9},
+    "growth": {"hp": 35, "atk": 8, "def": 8, "mat": 8, "mdf": 8, "mp": 5, "spd": 1},
+    "base_resist": 15,
+    "base_crit": 5,
+}
+
+BOSS_DEFINITIONS: list[BossTemplate] = [
+    {
+        "id": "dawn_treant",
+        "name": "黎明树卫",
+        "chapter": 1,
+        "level": 4,
+        "skills": ["heavy_slash", "guard_stance"],
+        "mechanic": "高生命教学型 Boss，每三回合进入守势。",
+        "reward": {
+            "exp": 80,
+            "gold": 75,
+            "drop_quality_weights": {"rare": 60, "uncommon": 40},
+            "keepsake_id": "dawn_treant_token",
+            "keepsake_chance": 25,
+            "carry_out": [],
+        },
+    },
+    {
+        "id": "storm_witch",
+        "name": "风暴女巫",
+        "chapter": 2,
+        "level": 7,
+        "skills": ["fireball", "cutting_chord", "arcane_focus"],
+        "mechanic": "偏魔法与异常状态，周期性提高技能命中。",
+        "reward": {
+            "exp": 80,
+            "gold": 75,
+            "drop_quality_weights": {"rare": 60, "uncommon": 40},
+            "keepsake_id": "storm_witch_token",
+            "keepsake_chance": 25,
+            "carry_out": [],
+        },
+    },
+    {
+        "id": "rift_dragon",
+        "name": "裂隙幼龙",
+        "chapter": 3,
+        "level": 10,
+        "skills": ["fireball", "heavy_slash", "smite"],
+        "mechanic": "最终 Boss，半血后攻击提升。",
+        "reward": {
+            "exp": 99,
+            "gold": 99,
+            "drop_quality_weights": {},
+            "keepsake_id": "rift_dragon_token",
+            "keepsake_chance": 25,
+            "carry_out": ["adventure_certificate"],
+        },
+    },
+]
+
+CHAPTER_DEFINITIONS: list[ChapterDefinition] = [
+    {
+        "id": 1,
+        "name": "黎明",
+        "min_floors": 3,
+        "max_floors": 5,
+        "node_weights": {"battle": 20, "elite": 5, "npc": 30, "shop": 15, "mystery": 20, "rest": 10, "boss": 0},
+        "boss_id": "dawn_treant",
+    },
+    {
+        "id": 2,
+        "name": "风暴",
+        "min_floors": 3,
+        "max_floors": 5,
+        "node_weights": {"battle": 35, "elite": 15, "npc": 20, "shop": 10, "mystery": 15, "rest": 5, "boss": 0},
+        "boss_id": "storm_witch",
+    },
+    {
+        "id": 3,
+        "name": "终局",
+        "min_floors": 3,
+        "max_floors": 5,
+        "node_weights": {"battle": 25, "elite": 35, "npc": 15, "shop": 10, "mystery": 10, "rest": 5, "boss": 0},
+        "boss_id": "rift_dragon",
+    },
+]
+
+TITLE_THRESHOLDS = [
+    (-999, "遗臭万年"),
+    (-500, "臭名远扬"),
+    (-200, "人见人嫌"),
+    (-50, "略讨人嫌"),
+    (0, "籍籍无名"),
+    (20, "小有名气"),
+    (50, "人见人爱"),
+    (200, "声名远扬"),
+    (500, "一代宗师"),
+    (800, "传奇英雄"),
+]
+
+RUN_REWARDS = {
+    "death_exp": 25,
+    "abandon_exp": 10,
+    "victory_reputation": 12,
+    "death_reputation": -4,
+    "abandon_reputation": -2,
+}
+
+# 事件池：在「神秘事件」节点按 random_event_outcome（正面/负面/无倾向）抽取，
+# 正面命中后有 ~10% 改抽 special。每个事件 effects 由 resolve_event_effects 自动结算。
+# 无倾向(neutral) 与 NPC 遭遇为“选项交互”类，待选项框架完成后再补。
+EVENT_POOLS: dict[str, list[dict[str, object]]] = {
+    "positive": [
+        {"id": "lost_chest", "name": "遗落的宝箱", "narration": "路边一个无人看管的宝箱，锁已生锈脱落。",
+         "effects": [{"type": "gold", "amount": [15, 40], "scale_chapter": True}]},
+        {"id": "healing_spring", "name": "治愈之泉", "narration": "岩缝中涌出泛蓝光的清泉，凑近时伤口隐隐作痒。",
+         "effects": [{"type": "heal_hp_pct", "pct": 30}]},
+        {"id": "mana_crystal", "name": "魔力结晶", "narration": "地上散落着几颗碎裂的魔力水晶，仍残留着能量。",
+         "effects": [{"type": "heal_mp_pct", "pct": 30}]},
+        {"id": "traveler_relic", "name": "旅人的遗物", "narration": "路边一个破旧背包，主人早已离去，里面还留着些有用的东西。",
+         "effects": [{"type": "item", "by_chapter": [["common", "practical"], ["practical", "rare"], ["rare", "uncommon"]]}]},
+        {"id": "wild_camp", "name": "野外营地", "narration": "一处被遗弃的营地，篝火余烬尚温，锅里还剩半碗汤。",
+         "effects": [{"type": "heal_hp_pct", "pct": 20}, {"type": "heal_mp_pct", "pct": 10},
+                     {"type": "pending_buff", "name": "休息充分", "mods": {"atk": 10, "mat": 10}, "duration": 3}]},
+        {"id": "lucky_clover", "name": "幸运四叶草", "narration": "草丛里一株四叶草在微风中轻轻摇摆。",
+         "effects": [{"type": "perm_dice", "stat": "luck", "amount": 3}]},
+        {"id": "miner_stash", "name": "老矿工的藏匿点", "narration": "墙壁上有处不自然的凹陷，一推露出小洞，里面塞着一袋硬币。",
+         "effects": [{"type": "gold", "amount": [25, 60], "scale_chapter": True}]},
+        {"id": "training_dummy", "name": "战斗训练假人", "narration": "空地上立着稻草假人，牌子写着“免费使用，打坏不赔”。",
+         "effects": [{"type": "exp", "amount": [15, 25]}]},
+        {"id": "shrine_blessing", "name": "神殿的祝福", "narration": "小神殿石像手心放着一颗发光珠子，你触碰了它。",
+         "effects": [{"type": "perm_core", "stat": "random", "amount": [5, 10]}]},
+        {"id": "forgotten_tome", "name": "被遗忘的藏书", "narration": "积灰的书架上一本书散发着微弱魔力，文字自动浮入脑海。",
+         "effects": [{"type": "exp", "amount": [20, 35]}, {"type": "perm_core", "stat": "mp", "amount": 5}]},
+        {"id": "wanderer_gift", "name": "流浪商人的馈赠", "narration": "一个衣衫褴褛的商人塞给你一样东西：“替我走下去。”",
+         "effects": [{"type": "item", "qualities": ["practical", "rare"], "only_consumable": True}]},
+        {"id": "warm_campfire", "name": "温暖的篝火", "narration": "树林深处一堆无人的篝火安静燃烧，疲惫消散了不少。",
+         "effects": [{"type": "cleanse"}, {"type": "heal_hp_pct", "pct": 15}]},
+    ],
+    "negative": [
+        {"id": "trap", "name": "陷阱！", "narration": "你一脚踩进落叶下的捕兽夹，疼痛从脚踝蔓延全身。",
+         "effects": [{"type": "damage_hp_pct_cur", "pct": 15}]},
+        {"id": "pickpocket", "name": "小偷！", "narration": "回头什么都没有，低头一摸——钱袋轻了。",
+         "effects": [{"type": "gold_loss", "amount": [20, 40]}]},
+        {"id": "curse_stele", "name": "诅咒石碑", "narration": "你不小心读出了石碑上看不懂的文字，一股寒意涌上心头。",
+         "effects": [{"type": "perm_dice", "stat": "random", "amount": -1}]},
+        {"id": "poison_fog", "name": "毒雾地带", "narration": "紫色薄雾弥漫，你还没捂住口鼻就吸入了一大口。",
+         "effects": [{"type": "damage_hp_pct_cur", "pct": 30}]},
+        {"id": "corrosive_swamp", "name": "腐蚀之沼", "narration": "地面突然松软，你掉进了酸性的沼泽液体。",
+         "effects": [{"type": "lose_equipment", "fallback": [{"type": "perm_core", "stat": "spd", "amount": -1}]}]},
+        {"id": "blackmarket_tax", "name": "黑市税收", "narration": "几个蒙面人挡住去路：“过路费。懂？”",
+         "effects": [{"type": "gold_loss", "pct": 30, "min": 10, "fallback_below_min": [{"type": "damage_hp_pct_cur", "pct": 10}]}]},
+        {"id": "rift_wind", "name": "裂隙之风", "narration": "地下裂缝涌出猛烈的魔力风暴，你被吹得站不稳脚。",
+         "effects": [{"type": "damage_mp_pct_cur", "pct": 20}]},
+        {"id": "greedy_chest", "name": "贪婪的箱子", "narration": "你兴奋地打开宝箱——一只小怪物弹出来叼走了你的东西。",
+         "effects": [{"type": "lose_consumable", "fallback": [{"type": "gold_loss", "amount": 15}]}]},
+        {"id": "got_lost", "name": "迷路", "narration": "你在岔路口选错方向，绕了一大圈才回到正轨。",
+         "effects": [{"type": "damage_hp_pct_max", "pct": 10}, {"type": "damage_mp_pct_cur", "pct": 10}]},
+        {"id": "misfortune", "name": "倒霉", "once": True, "narration": "你一路诸事不顺：被鸟屎砸中、被野猪撞、又被鞋带绊倒。",
+         "effects": [{"type": "perm_dice", "stat": "luck", "amount": -20}, {"type": "run_label", "label": "霉运"}]},
+    ],
+    "special": [
+        {"id": "hero", "name": "勇者", "narration": "天空放晴，一束光柱照在你身上，全身充满力量。",
+         "effects": [{"type": "perm_core_all", "amount": 10}, {"type": "perm_core", "stat": "spd", "amount": 1},
+                     {"type": "perm_core", "stat": "mp", "amount": 10}, {"type": "heal_full"}]},
+        {"id": "fate_gift", "name": "命运的馈赠", "narration": "地面裂开，一个金色宝箱缓缓升起。",
+         "effects": [{"type": "item", "qualities": ["uncommon", "legendary"]}]},
+        {"id": "ancient_legacy", "name": "古代英雄的传承", "narration": "隐藏墓室的石棺缓缓打开，一件闪光的装备浮在空中。",
+         "effects": [{"type": "item", "qualities": ["rare", "uncommon"], "only_job": True}]},
+        {"id": "exp_fountain", "name": "经验涌泉", "narration": "脚下魔法阵亮起，大贤者的记忆涌入你的身体。",
+         "effects": [{"type": "exp", "amount": 100}]},
+    ],
+    # 无倾向：抉择型（带 options，进入 event_choice 选项流程）或纯剧情。
+    "neutral": [
+        {"id": "altar", "name": "神秘祭坛", "narration": "黑色祭坛上刻着剑与盾两个凹槽，只能触碰一个。",
+         "options": [
+             {"label": "⚔️ 触碰剑（ATK+10，DEF-5）", "effects": [{"type": "perm_core", "stat": "atk", "amount": 10}, {"type": "perm_core", "stat": "def", "amount": -5}]},
+             {"label": "🛡️ 触碰盾（DEF+10，ATK-5）", "effects": [{"type": "perm_core", "stat": "def", "amount": 10}, {"type": "perm_core", "stat": "atk", "amount": -5}]},
+         ]},
+        {"id": "gambler_coin", "name": "赌徒的硬币", "narration": "赌徒挡住路：“猜正反。对了双倍奉还，错了……嘿嘿。”",
+         "options": [
+             {"label": "🎲 参加（押注当前金币的30%）", "effects": [{"type": "gamble_gold", "fraction": 0.3, "win_mult": 2}]},
+             {"label": "🚶 拒绝", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "life_mana_balance", "name": "生命与魔力的天平", "narration": "古老的天平浮在空中，左边一颗红心，右边一颗蓝宝石。",
+         "options": [
+             {"label": "❤️ 红心（HP上限+30，MP上限-10）", "effects": [{"type": "perm_core", "stat": "hp", "amount": 30}, {"type": "perm_core", "stat": "mp", "amount": -10}]},
+             {"label": "💎 宝石（MP上限+15，HP上限-25）", "effects": [{"type": "perm_core", "stat": "mp", "amount": 15}, {"type": "perm_core", "stat": "hp", "amount": -25}]},
+             {"label": "⚖️ 不碰", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "sealed_door", "name": "被封印的门", "narration": "被魔法封印的门上写着：“以鲜血或金币为钥。”",
+         "options": [
+             {"label": "🩸 献出鲜血（-20%当前HP，得稀有~罕见道具）", "effects": [{"type": "damage_hp_pct_cur", "pct": 20}, {"type": "item", "qualities": ["rare", "uncommon"]}]},
+             {"label": "💰 投入金币（60G，得稀有~罕见道具）", "cost": {"gold": 60}, "effects": [{"type": "item", "qualities": ["rare", "uncommon"]}]},
+             {"label": "🚶 离开", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "forest_singing", "name": "森林中的歌声", "narration": "远处传来精灵般悠扬的歌声，曲调欢快却带着忧伤。",
+         "options": [
+             {"label": "🎵 循声前往（吉凶未卜）", "effects": [{"type": "forest_song"}]},
+             {"label": "🚶 忽略", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "memory_mirror", "name": "记忆之镜", "narration": "镜中的倒影比你更强壮，镜子仿佛在问：“你想成为它吗？”",
+         "options": [
+             {"label": "🪞 触碰（重掷全部随机属性，取新值）", "effects": [{"type": "reroll_dice"}]},
+             {"label": "🚶 离开", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "time_rift", "name": "时间裂缝", "narration": "空间扭曲处出现一道裂缝，你隐约看到了另一个自己。",
+         "effects": [{"type": "nothing", "text": "你凝视裂缝中的身影良久，最终什么也没改变，只是心境沉静了几分。"}]},
+        {"id": "alchemy_table", "name": "废弃的炼金台", "narration": "炼金台上残留着材料，可以尝试合成，但配方已看不清了。",
+         "options": [
+             {"label": "🧪 合成（消耗1件消耗品，60%升级/40%失败）", "effects": [{"type": "craft_consumable"}]},
+             {"label": "🚶 离开", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "wishing_well", "name": "古老的许愿井", "narration": "清澈的井水上浮着几枚硬币，传说投一枚就能许愿。",
+         "options": [
+             {"label": "💰 投入10G（随机祈愿）", "cost": {"gold": 10}, "effects": [{"type": "random_effect", "options": [
+                 {"type": "heal_full"},
+                 {"type": "perm_dice", "stat": "random", "amount": 2},
+                 {"type": "gold", "amount": 30},
+                 {"type": "nothing", "text": "硬币沉入井底，什么也没发生。"},
+             ]}]},
+             {"label": "🚶 离开", "effects": [{"type": "nothing"}]},
+         ]},
+        {"id": "merchant_trouble", "name": "商人的难题", "narration": "一个商人的马车翻了，货物散落一地，他急得满头大汗。",
+         "options": [
+             {"label": "🤝 帮忙（此后商店价格-10%，本局可叠加）", "effects": [{"type": "shop_discount", "amount": 10}]},
+             {"label": "💰 趁火打劫（得20~40G，魅力-2）", "effects": [{"type": "gold", "amount": [20, 40]}, {"type": "perm_dice", "stat": "charm", "amount": -2}]},
+             {"label": "🚶 路过", "effects": [{"type": "nothing"}]},
+         ]},
+    ],
+    # NPC 遭遇：在 NPC 节点触发。社交选项用已落地的 说服/欺骗/威吓 判定公式（魅力相关）。
+    # 注：部分机制做了合理简化——跳节点/精灵之粉/赏金“下一场战斗”条件等改为即时奖励。
+    "npc": [
+        {"id": "alchemist", "name": "旅行药剂师", "narration": "“需要点什么？我这儿有好东西，不过得看你出不出得起价。”",
+         "options": [
+             {"label": "🛒 购买药品", "type": "open_shop", "shop": {"types": ["potion"], "count": 2, "price_mult": 1.0}},
+             {"label": "🗣️ 说服打折（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "item", "qualities": ["common", "practical"], "only_consumable": True}],
+              "fail": [{"type": "nothing", "text": "“想白拿？没门。”"}]},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "wounded_knight", "name": "受伤的骑士", "narration": "一个骑士靠在树下，盔甲满是裂痕：“旅人……能帮我包扎一下吗？”",
+         "options": [
+             {"label": "❤️ 帮忙治疗（消耗1件消耗品）", "type": "effect", "require": {"consumable": 1},
+              "effects": [{"type": "consume_one"}, {"type": "item", "qualities": ["practical", "rare"]}]},
+             {"label": "🗣️ 安慰鼓励（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "gold", "amount": 30}, {"type": "exp", "amount": 10}], "fail": []},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "fortune_teller", "name": "神秘的占卜师", "narration": "蒙着面纱的女人坐在水晶球后：“我能看见你的命运。要听吗？”",
+         "options": [
+             {"label": "🔮 付费占卜（30G，揭示前路）", "type": "reveal", "cost": {"gold": 30}},
+             {"label": "🗣️ 请求免费占卜（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "perm_dice", "stat": "luck", "amount": 1}], "fail": [{"type": "nothing", "text": "“命运不是免费的，亲爱的。”"}]},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "tavern_keeper", "name": "酒馆老板", "narration": "“欢迎光临！坐下来喝一杯？我这儿消息灵通得很。”",
+         "options": [
+             {"label": "🍺 喝一杯（10G）", "type": "effect", "cost": {"gold": 10}, "effects": [{"type": "heal_hp_pct", "pct": 15}]},
+             {"label": "🍺 大请客（30G）", "type": "effect", "cost": {"gold": 30}, "effects": [{"type": "heal_hp_pct", "pct": 25}]},
+             {"label": "🗣️ 套情报（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "heal_hp_pct", "pct": 15}], "fail": [{"type": "nothing", "text": "你被赶出了酒馆。"}]},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "street_bard", "name": "流浪的吟游诗人", "narration": "一个弹着琉特琴的吟游诗人坐在路边，曲调欢快却带忧伤。",
+         "options": [
+             {"label": "🎵 驻足聆听", "type": "effect", "effects": [{"type": "heal_mp_pct", "pct": 10}, {"type": "exp", "amount": 15}]},
+             {"label": "🗣️ 一起合奏（社交，诗人天然占优）", "type": "social", "action": "说服",
+              "success": [{"type": "item", "qualities": ["rare", "uncommon"]}], "fail": []},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "black_market", "name": "黑市商人", "narration": "一个鬼鬼祟祟的身影从暗巷招手：“嘿……过来看看。”（货物只标稀有度，买下才知是什么）",
+         "options": [
+             {"label": "🛒 看看货物（盲盒·9折）", "type": "open_shop",
+              "shop": {"qualities": ["trash", "common", "practical", "rare"], "count": 3, "price_mult": 0.9, "blind": True}},
+             {"label": "🗣️ 讨价还价（社交）", "type": "social",
+              "success": [{"type": "shop_discount", "amount": 10}], "fail": [{"type": "nothing", "text": "“滚。”"}]},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "ancient_guard", "name": "古老的守卫", "narration": "石像般的守卫挡住岔路：“回答我的问题，否则不得通过。”",
+         "options": [
+             {"label": "🧠 回答问题（答对有奖，答错-20%HP）", "type": "effect",
+              "effects": [{"type": "riddle", "correct_chance": 50,
+                           "correct": [{"type": "gold", "amount": [25, 40]}, {"type": "item", "qualities": ["rare", "uncommon"]}],
+                           "wrong": [{"type": "damage_hp_pct_cur", "pct": 20}]}]},
+             {"label": "🗣️ 说服放行（社交，失败强制战斗）", "type": "social", "action": "说服", "fail_battle": True,
+              "success": [{"type": "gold", "amount": [25, 40]}, {"type": "item", "qualities": ["rare", "uncommon"]}], "fail": []},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "lost_fairy", "name": "迷路的小精灵", "narration": "一个发着微光的小精灵焦急地飞来飞去：“我找不到回家的路了！”",
+         "options": [
+             {"label": "🏠 帮它找路", "type": "effect", "effects": [{"type": "perm_dice", "stat": "luck", "amount": 2}, {"type": "item", "qualities": ["practical"]}]},
+             {"label": "🗣️ 安慰它（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "item", "qualities": ["rare"]}], "fail": []},
+             {"label": "🚶 忽略", "type": "leave"},
+         ]},
+        {"id": "retired_adventurer", "name": "退役冒险者", "narration": "独臂老者坐在路边磨剑：“年轻人，要不要切磋两招？”",
+         "options": [
+             {"label": "⚔️ 切磋（友好战斗，不损HP）", "type": "effect",
+              "effects": [{"type": "friendly_battle",
+                           "win": [{"type": "exp", "amount": 30}, {"type": "item", "qualities": ["uncommon"]}],
+                           "lose": [{"type": "exp", "amount": 15}, {"type": "perm_core", "stat": "def", "amount": 5}]}]},
+             {"label": "🗣️ 聊天（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "exp", "amount": 20}, {"type": "item", "qualities": ["uncommon"]}], "fail": []},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "elf_merchant", "name": "精灵商会代表", "narration": "衣着华丽的精灵鞠了一躬：“我们商会正在收购冒险物品。”",
+         "options": [
+             {"label": "💰 出售道具（自选，回收60%）", "type": "sell", "mult": 0.6},
+             {"label": "🗣️ 谈判提价（社交，成功回收100%）", "type": "social", "then_sell": {"success": 1.0, "fail": 0.6}},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+        {"id": "mist_witch", "name": "迷雾中的巫女", "narration": "浓雾中出现穿白衣的女人：“你身上有伤。我能帮你，但需要代价。”",
+         "options": [
+             {"label": "❤️ 接受治疗（回满HP/MP，随机骰子-3）", "type": "effect",
+              "effects": [{"type": "heal_full"}, {"type": "perm_dice", "stat": "random", "amount": -3}]},
+             {"label": "🗣️ 请求无代价治疗（社交）", "type": "social", "action": "说服",
+              "success": [{"type": "heal_full"}], "fail": [{"type": "nothing", "text": "巫女消失在雾中。"}]},
+             {"label": "🚶 拒绝", "type": "leave"},
+         ]},
+        {"id": "bounty_board", "name": "赏金猎人公告板", "narration": "墙上贴着几张赏金公告，一个管理员在旁边打瞌睡。",
+         "options": [
+             {"label": "📜 接受赏金任务（立即进入战斗，胜利得奖励）", "type": "bounty", "rewards": [
+                 [{"type": "gold", "amount": 40}],
+                 [{"type": "item", "qualities": ["rare", "uncommon"]}],
+                 [{"type": "exp", "amount": 25}],
+             ]},
+             {"label": "🗣️ 套近乎拿高价任务（社交）", "type": "social",
+              "success": [{"type": "gold", "amount": 50}, {"type": "item", "qualities": ["uncommon"]}], "fail": []},
+             {"label": "🚶 离开", "type": "leave"},
+         ]},
+    ],
+}
+
+SPECIAL_EVENT_CHANCE = 10  # 正面命中后改抽 special 的百分比概率
+
+ENGINE_FORMULAS = {
+    "level_next_exp": "15 + 5 * current_level",
+    "random_stats": "crit/resist_bonus/luck/charm each randint(0, 20)",
+    "total_resist_percent": "骰子抗性(d20) * 3 + 基础抗性%",
+    "combat_crit_rate": "(基础暴击 + 骰子暴击 + 增益) * 幸运/10 + 0.1，暴击倍率 1.5",
+    "dodge_rate": "luck percent, clamped by active luck states",
+    "positive_event_rate": "min(99%, 20 + luck)",
+    "negative_event_rate_when_not_positive": "max(1%, 40 - luck)",
+    "npc_affinity": "floor(reputation / 10) + charm + randint(-10, 10), clamp [-99, 90]",
+    "shop_quality_score": "30 + luck * 2 + randint(-10, 30), clamp [0, 100]",
+    "shop_price": "base_price * max(50%, quality_score + 100 - charm * 2)",
+    "physical_damage": "floor(ATK * 100 * k / (100 + DEF) * crit_multiplier)，k=round(random(0.95,1.05),2)",
+    "magical_damage": "floor(MAT * 100 * k / (100 + MDF) * crit_multiplier)，k=round(random(0.95,1.05),2)",
+    "escape_rate": "((own_atk - enemy_atk) / max(1, enemy_atk)) * 50 + 20 + luck, clamp [0, 100]",
+    "death_branch_rate": "max(0.1%, 20 + luck)",
+    "combo_rate": "spd + luck，clamp [0,100]；攻击后追加普攻，最多 MAX_COMBO_HITS 次",
+    "interrupt_rate": "fast_spd ≥ slow_spd×1.5 时 (fast_spd - slow_spd)*5 + fast_luck，clamp [0,100]；命中则慢方失去本回合行动",
+    "status_apply_rate": "max(0%, 100 - 总抗性%)",
+    "status_damage": "floor(MAT * 10 / (100 + MDF) * base_value * max(0, 100 - 总抗性%) / 100)，不吃暴击",
+}

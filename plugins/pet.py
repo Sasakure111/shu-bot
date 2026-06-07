@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from nonebot import get_bot, on_command, require
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageEvent, MessageSegment
 from nonebot.params import CommandArg
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler
@@ -16,8 +16,10 @@ from nonebot_plugin_apscheduler import scheduler
 from .database import (
     MAX_PET_LEVEL,
     add_pet_affection,
+    add_pet_affection_to,
     add_pet_exp,
     add_pet_reward,
+    add_pet_reward_to,
     consume_daily_pet_interaction,
     create_pet_for_user,
     ensure_broadcast_target,
@@ -32,6 +34,7 @@ from .database import (
     get_random_special_pet_type,
     list_user_pets,
     mark_daily_checkin,
+    release_pet,
     set_broadcast_enabled,
     set_last_battle_challenge_at,
     set_last_played_at,
@@ -41,7 +44,7 @@ from .message_utils import reply_message, should_ignore_group_message
 
 load_dotenv(".env.prod")
 
-client = OpenAI(
+client = AsyncOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_BASE_URL"),
 )
@@ -142,16 +145,21 @@ def capture_rate(carried_pet) -> int:
     return min(95, base + level_bonus)
 
 
+def pet_level_multiplier(level: int) -> float:
+    """等级成长系数：线性 +50%/级（Lv1 = ×1.0），替代原先的指数 1.5^level，避免高等级数值爆炸。"""
+    return 1 + 0.5 * (int(level) - 1)
+
+
 def pet_max_hp(pet) -> int:
-    return int(int(pet["hp"]) * (1.5 ** int(pet["level"])))
+    return int(int(pet["hp"]) * pet_level_multiplier(pet["level"]))
 
 
 def pet_attack_power(pet) -> int:
-    return int(int(pet["attack"]) * (1.5 ** int(pet["level"]))) + int(pet["affection"]) // 20
+    return int(int(pet["attack"]) * pet_level_multiplier(pet["level"])) + int(pet["affection"]) // 20
 
 
 def pet_speed_value(pet) -> int:
-    return int(int(pet["speed"]) * (1.5 ** int(pet["level"])))
+    return int(int(pet["speed"]) * pet_level_multiplier(pet["level"]))
 
 
 def parse_at_user(message: Message) -> int | None:
@@ -218,7 +226,7 @@ def affection_stage(affection: int) -> str:
     return "有些熟悉，愿意靠近但还带着试探"
 
 
-def build_pet_interaction(pet) -> str:
+async def build_pet_interaction(pet) -> str:
     affection = int(pet["affection"])
     prompt = (
         "请描写一段用户与当前携带宠物互动的中文场景。"
@@ -227,7 +235,7 @@ def build_pet_interaction(pet) -> str:
         "好感度越高互动越亲密，但保持温暖可爱。"
         f"宠物名：{pet['name']}；好感度：{affection}/100；亲密程度：{affection_stage(affection)}。"
     )
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model="deepseek-chat",
         messages=[
             {"role": "system", "content": "你是宠物互动场景描写助手，输出简短、具体、有画面感。"},
@@ -287,7 +295,8 @@ async def send_group_boss(bot: Bot, group_id: int) -> None:
         "attack": boss_attack,
         "speed": boss_speed,
         "expires_at": expires_at,
-        "participants": set(),
+        "participants": set(),       # 参战训练师 user_id（特殊掉落、人数统计用）
+        "participant_pets": set(),   # 真正出过手的宠物 pet_id（经验/好感按此发，含中途倒下/被替换的）
         "damage": {},
         "pet_hp": {},
         "defeated_pets": set(),
@@ -357,14 +366,17 @@ async def expire_battle_challenges() -> None:
             print(f"[PET] 对战超时播报失败: group:{group_id} {type(exc).__name__}: {exc}")
 
 
-def build_boss_reward_text(participants: set[int]) -> str:
+def build_boss_reward_text(participants: set[int], participant_pets: set[int]) -> str:
     lines = [
-        f"Boss 被击败了！参与讨伐的 {len(participants)} 位用户获得奖励：",
-        f"出战宠物 +{BOSS_REWARD_EXP} 经验，+{BOSS_REWARD_AFFECTION} 好感度。",
+        f"Boss 被击败了！{len(participants)} 位训练师、{len(participant_pets)} 只出战宠物获得奖励：",
+        f"每只出战过的宠物 +{BOSS_REWARD_EXP} 经验，+{BOSS_REWARD_AFFECTION} 好感度。",
     ]
+    # 经验/好感按"真正出过手的宠物"发，中途倒下或被替换下场的也算
+    for pet_id in participant_pets:
+        add_pet_reward_to(pet_id, BOSS_REWARD_EXP, BOSS_REWARD_AFFECTION)
+    # 特殊宠物掉落仍按训练师计算（每位参战玩家一次机会）
     special_rewards = []
     for user_id in participants:
-        add_pet_reward(user_id, BOSS_REWARD_EXP, BOSS_REWARD_AFFECTION)
         if len(list_user_pets(user_id)) >= 50:
             continue
         if random.randint(1, 100) <= BOSS_SPECIAL_REWARD_RATE:
@@ -427,6 +439,41 @@ async def pet_boss_expire_check() -> None:
     await expire_battle_challenges()
 
 
+PET_MENU_TEXT = """🐾 宠物菜单
+
+📋 查看 / 管理
+  /我的宠物              (查看/初次领取宠物)
+  /查看仓库              (查看已拥有的宠物)
+  /切换宠物 <宠物id>     (切换当前携带宠物，示例 /切换宠物 1)
+  /弃养 <宠物id>         (弃养指定宠物，不可恢复，示例 /弃养 12)
+
+💕 养成
+  /打卡                  (每日一次，增加经验)
+  /玩耍                  (每小时一次，额外经验)
+  /互动                  (与高好感度宠物互动)
+
+⚔️ 玩法
+  /捕捉                  (捕捉播报出现的野生宠物)
+  /讨伐                  (参与群聊公屏Boss)
+  /发起对战 @用户        (发起宠物对战)
+  /接受挑战              (接受别人发起的宠物对战)
+
+📢 设置
+  /开启播报 /关闭播报   (控制野生宠物播报)
+
+*温馨提示：群聊内互动要 @我 哦！"""
+
+
+pet_menu_cmd = on_command("宠物", priority=4, block=True)
+
+
+@pet_menu_cmd.handle()
+async def handle_pet_menu(event: MessageEvent):
+    if should_ignore_group_message(event):
+        return
+    await pet_menu_cmd.finish(reply_message(event, PET_MENU_TEXT))
+
+
 my_pet_cmd = on_command("我的宠物", priority=4, block=True)
 
 
@@ -481,6 +528,40 @@ async def handle_switch_pet(event: MessageEvent, args: Message = CommandArg()):
             event,
             f"已切换当前携带宠物: {pet['name']} {rarity_stars(pet['rarity'])}\n"
             f"等级: {pet_level_text(pet['level'])}",
+        )
+    )
+
+
+release_pet_cmd = on_command("弃养", priority=4, block=True)
+
+
+@release_pet_cmd.handle()
+async def handle_release_pet(event: MessageEvent, args: Message = CommandArg()):
+    if should_ignore_group_message(event):
+        return
+
+    ensure_default_broadcast_for_event(event)
+    pet_id_text = args.extract_plain_text().strip()
+    if not pet_id_text:
+        await release_pet_cmd.finish(
+            reply_message(event, "用法: /弃养 <宠物id>，例如 /弃养 12\n可以先用 /查看仓库 查看宠物 ID。")
+        )
+
+    try:
+        pet_id = int(pet_id_text)
+    except ValueError:
+        await release_pet_cmd.finish(reply_message(event, "宠物 ID 需要是数字。可以先用 /查看仓库 查看。"))
+
+    released = release_pet(event.user_id, pet_id)
+    if released is None:
+        await release_pet_cmd.finish(reply_message(event, "找不到这只宠物，或者它不在你的仓库里。"))
+
+    await release_pet_cmd.finish(
+        reply_message(
+            event,
+            f"已弃养 {released['name']} {rarity_stars(released['rarity'])}（ID {pet_id}，Lv.{pet_level_text(released['level'])}）。\n"
+            f"如果它是你当前携带的宠物，已自动帮你换上仓库里的另一只。\n"
+            f"江湖路远，愿它一切安好 ⌓‿⌓",
         )
     )
 
@@ -574,7 +655,7 @@ async def handle_interact(event: MessageEvent):
         )
 
     try:
-        interaction = build_pet_interaction(pet)
+        interaction = await build_pet_interaction(pet)
     except Exception as exc:
         print(f"[PET] 互动生成失败: {type(exc).__name__}: {exc}")
         interaction = f"你轻轻靠近{pet['name']}，它抬头看了看你，慢慢贴过来蹭了蹭你的手心。"
@@ -737,6 +818,7 @@ async def handle_boss_attack(event: MessageEvent):
 
     if pet_dealt > 0:
         boss["participants"].add(user_id)
+        boss["participant_pets"].add(pet_id)  # 这只宠物真的出过手，记下来好发奖
         boss["damage"][user_id] = int(boss["damage"].get(user_id, 0)) + pet_dealt
 
     if pet_defeated:
@@ -747,9 +829,10 @@ async def handle_boss_attack(event: MessageEvent):
         boss_name = boss["name"]
         boss_level = boss["level"]
         participants = boss["participants"]
+        participant_pets = boss["participant_pets"]
         damage_board = boss["damage"]
         active_group_bosses.pop(int(event.group_id), None)
-        reward_text = build_boss_reward_text(participants)
+        reward_text = build_boss_reward_text(participants, participant_pets)
 
         sorted_damage = sorted(damage_board.items(), key=lambda x: x[1], reverse=True)
         intro = "\n".join(logs) + f"\n\n{boss_name}（Lv.{boss_level}） 被击败了！\n{reward_text}\n===伤害排行===\n"
@@ -840,9 +923,14 @@ async def handle_battle_accept(event: MessageEvent):
     defender_is_new = get_current_pet(defender_id) is None
 
     winner_id, logs = simulate_pet_battle(challenger_id, defender_id)
+    # 取实际出战的宠物 id（对战同步结算，期间不会换宠），奖励直接落到这两只身上
+    challenger_pet_id = int(ensure_current_pet(challenger_id)["id"])
+    defender_pet_id = int(ensure_current_pet(defender_id)["id"])
     loser_id = defender_id if winner_id == challenger_id else challenger_id
-    winner_pet, winner_leveled = add_pet_reward(winner_id, BATTLE_REWARD_EXP, BATTLE_WIN_AFFECTION)
-    loser_pet = add_pet_affection(loser_id, BATTLE_LOSE_AFFECTION)
+    winner_pet_id = challenger_pet_id if winner_id == challenger_id else defender_pet_id
+    loser_pet_id = defender_pet_id if winner_id == challenger_id else challenger_pet_id
+    winner_pet, winner_leveled = add_pet_reward_to(winner_pet_id, BATTLE_REWARD_EXP, BATTLE_WIN_AFFECTION)
+    loser_pet = add_pet_affection_to(loser_pet_id, BATTLE_LOSE_AFFECTION)
 
     level_text = f"，升级 {winner_leveled} 级" if winner_leveled > 0 else ""
     result_text = (
