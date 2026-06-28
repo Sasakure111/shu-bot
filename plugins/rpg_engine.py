@@ -54,7 +54,60 @@ def get_item_template(item_id: str) -> dict[str, Any]:
     for item in rpg_data.ITEM_POOLS:
         if item["id"] == item_id:
             return dict(item)
+    for book in rpg_data.SKILL_BOOKS:  # 技能书单独注册，不混进随机道具池
+        if book["id"] == item_id:
+            return dict(book)
     raise ValueError(f"unknown item id: {item_id}")
+
+
+def learn_skill(character: dict[str, Any], skill_id: str) -> tuple[bool, str]:
+    """尝试学会技能。返回 (是否学会, 原因码)：
+    already_known（已会）/ slots_full（技能栏满，需先 /遗忘）/ learned（学会）。
+    """
+    skills = character.setdefault("skills", [])
+    if skill_id in skills:
+        return False, "already_known"
+    if len(skills) >= rpg_data.MAX_SKILL_SLOTS:
+        return False, "slots_full"
+    skills.append(skill_id)
+    return True, "learned"
+
+
+def forget_skill(character: dict[str, Any], index: int) -> tuple[bool, str, str | None]:
+    """遗忘技能栏第 index 个技能（0 基）。返回 (是否成功, 原因码, 技能名)。
+    至少保留 1 个技能；出生技（innate）不可遗忘。
+    """
+    skills = character.get("skills", [])
+    if index < 0 or index >= len(skills):
+        return False, "no_skill", None
+    if len(skills) <= 1:
+        return False, "last_skill", None
+    skill_id = skills[index]
+    try:
+        tpl = get_skill_template(skill_id)
+    except ValueError:
+        tpl = {}
+    if tpl.get("innate"):
+        return False, "innate", str(tpl.get("name", skill_id))
+    skills.pop(index)
+    return True, "forgotten", str(tpl.get("name", skill_id))
+
+
+def roll_skill_book(
+    class_id: str | None,
+    rng: random.Random,
+    *,
+    qualities: Sequence[str] | None = None,
+) -> dict[str, Any] | None:
+    """随机抽一本技能书：只给"通用书 + 当前职业专属书"，可按品质过滤。返回书道具模板或 None。"""
+    candidates = [
+        dict(book) for book in rpg_data.SKILL_BOOKS
+        if book.get("class_req") in (None, class_id)
+        and (qualities is None or book.get("quality") in set(qualities))
+    ]
+    if not candidates:
+        return None
+    return rng.choice(candidates)
 
 
 def get_boss_template(boss_id: str) -> dict[str, Any]:
@@ -170,6 +223,28 @@ def item_category(item: dict[str, Any]) -> str:
     return "consumable"
 
 
+def special_effect_id(item: dict[str, Any]) -> str | None:
+    effects = item.get("effects", {})
+    if not isinstance(effects, dict):
+        return None
+    value = effects.get("special")
+    return str(value) if value else None
+
+
+def is_special_item(item: dict[str, Any]) -> bool:
+    return item.get("type") == "special" or special_effect_id(item) is not None
+
+
+def is_active_special_item(item: dict[str, Any]) -> bool:
+    effects = item.get("effects", {})
+    return is_special_item(item) and isinstance(effects, dict) and effects.get("trigger") == "active"
+
+
+def inventory_backpack_slots(character: dict[str, Any]) -> int:
+    bonus = int(character.get("backpack_slot_bonus", 0))
+    return clamp_int(rpg_data.MAX_BACKPACK_SLOTS + bonus, rpg_data.MAX_BACKPACK_SLOTS, rpg_data.MAX_BACKPACK_SLOTS_WITH_BONUS)
+
+
 def item_category_by_id(item_id: str) -> str:
     return item_category(get_item_template(item_id))
 
@@ -179,10 +254,13 @@ def list_consumables(character: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for entry in character.get("inventory", []):
         try:
-            if item_category_by_id(entry["id"]) == "consumable":
-                result.append(entry)
+            item = get_item_template(entry["id"])
         except ValueError:
             continue
+        if item.get("type") == "skillbook":  # 技能书走局外学习，不在战斗道具菜单
+            continue
+        if item_category(item) == "consumable" and (not is_special_item(item) or is_active_special_item(item)):
+            result.append(entry)
     return result
 
 
@@ -285,16 +363,26 @@ def can_add_item(character: dict[str, Any], item_id: str) -> tuple[bool, str]:
     category = item_category(item)
     inventory = character.get("inventory", [])
     equipment = character.get("equipment", [])
+    capacity = inventory_backpack_slots(character)
+
+    if is_special_item(item):
+        if any(e["id"] == item_id for e in inventory) or any(e["id"] == item_id for e in equipment):
+            return False, "duplicate_special"
+        if special_effect_id(item) == "backpack_slot" and len(inventory) == capacity and capacity < rpg_data.MAX_BACKPACK_SLOTS_WITH_BONUS:
+            return True, "new"
+        if len(inventory) >= capacity:
+            return False, "backpack_full"
+        return True, "new"
 
     if category == "equipment":
         if any(e["id"] == item_id for e in inventory) or any(e["id"] == item_id for e in equipment):
             return False, "duplicate_equipment"  # 同名装备只能持 1 个
-        if len(inventory) >= rpg_data.MAX_BACKPACK_SLOTS:
+        if len(inventory) >= capacity:
             return False, "backpack_full"
         return True, "new"
 
     if category == "attribute":  # 不可叠到同格，但可占多个格子
-        if len(inventory) >= rpg_data.MAX_BACKPACK_SLOTS:
+        if len(inventory) >= capacity:
             return False, "backpack_full"
         return True, "new"
 
@@ -302,7 +390,7 @@ def can_add_item(character: dict[str, Any], item_id: str) -> tuple[bool, str]:
     for entry in inventory:
         if entry["id"] == item_id and int(entry.get("quantity", 1)) < rpg_data.MAX_STACK:
             return True, "stack"
-    if len(inventory) >= rpg_data.MAX_BACKPACK_SLOTS:
+    if len(inventory) >= capacity:
         return False, "backpack_full"
     return True, "new"
 
@@ -349,7 +437,7 @@ def unequip_item(character: dict[str, Any], equip_index: int) -> tuple[bool, str
     if equip_index < 0 or equip_index >= len(equipment):
         return False, "no_item", None
     item = get_item_template(equipment[equip_index]["id"])
-    if len(inventory) >= rpg_data.MAX_BACKPACK_SLOTS:
+    if len(inventory) >= inventory_backpack_slots(character):
         return False, "backpack_full", item
     equipment.pop(equip_index)
     inventory.append({"id": item["id"], "quantity": 1})
@@ -413,10 +501,14 @@ def enemy_level_for_node(player_level: int, chapter: int, node_type: str) -> int
         )
         if boss is not None:
             return int(boss["level"])
-    bonus = int(chapter) - 1
-    if node_type == "elite":
-        bonus += 1
-    return clamp_int(int(player_level) + bonus, 1, rpg_data.MAX_PLAYER_LEVEL)
+    # 每章敌人等级限定在固定区间内：第1章 1-3、第2章 4-6、第3章 7-9
+    # （= [3*章-2, 3*章]，正好比本章 Boss 低 1~3 级）。
+    # 敌人仍随玩家等级浮动，但即便玩家越级（例如读入高等级存档）也按本章上下限封顶，
+    # 不会刷出超出本章范围的怪。精英取区间高位。
+    chapter_max = min(3 * int(chapter), rpg_data.MAX_PLAYER_LEVEL)
+    chapter_min = max(1, chapter_max - 2)
+    bonus = 1 if node_type == "elite" else 0
+    return clamp_int(int(player_level) + bonus, chapter_min, chapter_max)
 
 
 def roll_enemy_rank(rng: random.Random, *, elite: bool = False) -> str:
@@ -712,11 +804,42 @@ def apply_consumable_effects(
     character["stats"] = stats
     effects = item.get("effects", {})
     lines: list[str] = []
+    special = special_effect_id(item)
 
     max_hp = max(1, int(stats.get("hp", 1)))
     max_mp = max(0, int(stats.get("mp", 0)))
     cur_hp = int(character.get("current_hp", max_hp))
     cur_mp = int(character.get("current_mp", max_mp))
+
+    if special == "abyss_contract":
+        perm = _ensure_perm_core_bonus(character)
+        for key in ("atk", "mat"):
+            perm[key] = int(perm.get(key, 0)) + max(1, round(int(stats.get(key, 0)) * 0.30))
+        perm["hp"] = int(perm.get("hp", 0)) - max(1, round(max_hp * 0.20))
+        character = recompute_character_stats(character)
+        character["current_hp"] = min(int(character["stats"]["hp"]), max(1, int(character.get("current_hp", max_hp))))
+        lines.append("签下深渊契约：HP永久下降，ATK与MAT永久上升。")
+        return character, lines
+
+    if special == "reroll_random_keep_best":
+        old_stats = dict(character.get("base_random_stats", character.get("random_stats", {})))
+        rolled = roll_random_stats(rng)
+        character["base_random_stats"] = {
+            key: max(int(old_stats.get(key, 0)), int(rolled.get(key, 0)))
+            for key in RANDOM_STAT_KEYS
+        }
+        character = recompute_character_stats(character)
+        final = character["random_stats"]
+        lines.append(
+            "命运改写完成："
+            f"暴击{final['crit']} 抗性{final['resist']} 幸运{final['luck']} 魅力{final['charm']}。"
+        )
+        return character, lines
+
+    if special == "final_reward_multiplier":
+        character["final_reward_multiplier"] = max(float(character.get("final_reward_multiplier", 1.0)), float(effects.get("mult", 2.0)))
+        lines.append("创世纪录展开：本局正常结局最终奖励倍率变为2。")
+        return character, lines
 
     if effects.get("heal_full"):
         cur_hp, cur_mp = max_hp, max_mp
@@ -797,6 +920,10 @@ def apply_skill_status(
 ) -> tuple[dict[str, Any], str | None]:
     """技能命中后按 技能proc率 × 状态命中率 尝试给 target 附加状态，已有则刷新持续回合。"""
     status_id = skill.get("status")
+    if not status_id:  # E4：随机异常池，命中时从中挑一个
+        pool = skill.get("status_pool")
+        if pool:
+            status_id = rng.choice(list(pool))
     if not status_id:
         return target, None
     defn = rpg_data.STATUS_DEFINITIONS.get(status_id)
@@ -818,7 +945,9 @@ def calculate_damage(
     *,
     damage_type: str = "physical",
     attack_bonus: float = 0.0,
+    power_multiplier: float = 1.0,
     crit_multiplier: float = 1.5,
+    defense_mult: float = 1.0,
     rng: random.Random,
 ) -> dict[str, Any]:
     dodged = rng.random() * 100 < dodge_rate(defender)
@@ -838,8 +967,10 @@ def calculate_damage(
     else:
         attack = max(0, float(stats.get("atk", 0))) * atk_mat_mult
         defense = max(0, float(target_stats.get("def", 0)))
+    defense *= max(0.0, float(defense_mult))  # 无视防御类技能（pierce_def）按系数削减目标防御
 
-    attack += float(attack_bonus)
+    # power_multiplier 为技能伤害倍率（普攻=1.0），作用在攻击力上；attack_bonus 为额外平摊加成
+    attack = attack * float(power_multiplier) + float(attack_bonus)
     # 攻击伤害 = (ATK * 100 * k) / (100 + DEF)，暴击 ×1.5，最终向下取整
     raw = (attack * 100 * coefficient) / (100 + defense) * multiplier
     # 易伤：冰冻受物理 +50%（受指定类型攻击时放大）
@@ -893,12 +1024,30 @@ def resolve_skill_attack(
     attacker_after["current_mp"] = current_mp - mp_cost
     skill_type = skill.get("type", "physical")
     if skill_type == "support":
+        # 支援技：自身限时增益（self_buff）+ 回血（power>0 按 MAT×power；E3 百分比/定额）+ 回蓝（E3）。
+        heal = 0
         heal_multiplier = float(attacker_after.get("heal_multiplier", 1.0))  # 牧师治疗加成
-        heal = max(1, int((attacker_after["stats"].get("mat", 0) + float(skill.get("power", 0))) * heal_multiplier))
-        attacker_after["current_hp"] = min(
-            int(attacker_after["stats"]["hp"]),
-            int(attacker_after.get("current_hp", attacker_after["stats"]["hp"])) + heal,
-        )
+        buff = skill.get("self_buff")
+        if buff:
+            attacker_after = apply_buff(
+                attacker_after,
+                name=str(buff.get("name", skill.get("name", "增益"))),
+                mods=dict(buff.get("mods", {})),
+                duration=int(buff.get("duration", 3)),
+            )
+        max_hp = int(attacker_after["stats"].get("hp", 1))
+        heal_power = float(skill.get("power", 0.0))
+        if heal_power > 0:  # 沿用：MAT×power 治疗
+            heal += max(1, int(attacker_after["stats"].get("mat", 0) * heal_power * heal_multiplier))
+        if "heal_hp_percent" in skill:  # E3：按最大 HP 百分比回血
+            heal += int(max_hp * int(skill["heal_hp_percent"]) / 100 * heal_multiplier)
+        if "heal_hp_flat" in skill:  # E3：定额回血（不吃 MAT，物理职可用）
+            heal += int(int(skill["heal_hp_flat"]) * heal_multiplier)
+        if heal > 0:
+            attacker_after["current_hp"] = min(
+                max_hp, int(attacker_after.get("current_hp", max_hp)) + heal
+            )
+        attacker_after = _apply_skill_mp_restore(attacker_after, skill)  # E3：回蓝
         return {
             "ok": True,
             "skill": skill,
@@ -906,30 +1055,103 @@ def resolve_skill_attack(
             "defender": defender,
             "support_only": True,
             "heal": heal,
+            "buff": buff,
         }
 
     damage_type = "magical" if skill_type == "magical" else "physical"
-    result = calculate_damage(
-        attacker_after,
-        defender,
-        damage_type=damage_type,
-        attack_bonus=float(skill.get("power", 0.0)),
-        rng=rng,
-    )
+
+    # —— E6：传奇特殊机制（在伤害结算前确定倍率/暴击/穿防修正）——
+    power = float(skill.get("power", 1.0))
+    crit_mult = 1.5
+    defense_mult = 1.0
+    extra_mult = 1.0
+    special = skill.get("special")
+    sargs = skill.get("special_args", {})
+    if special == "low_hp_bonus":  # 自身 HP 越低伤害越高
+        a_max = max(1, int(attacker_after["stats"].get("hp", 1)))
+        if int(attacker_after.get("current_hp", a_max)) / a_max <= float(sargs.get("threshold", 0.3)):
+            extra_mult *= float(sargs.get("mult", 1.5))
+    elif special == "execute":  # 处决：目标残血时加伤
+        d_max = max(1, int(defender["stats"].get("hp", 1)))
+        if int(defender.get("current_hp", d_max)) / d_max < float(sargs.get("threshold", 0.5)):
+            extra_mult *= float(sargs.get("mult", 1.8))
+    elif special == "crit_override":  # 暴击倍率改写
+        crit_mult = float(sargs.get("crit_mult", 2.5))
+    elif special == "pierce_def":  # 无视部分防御
+        defense_mult = float(sargs.get("def_mult", 0.5))
+    elif special == "smite_status":  # 对带异常的敌人加伤
+        if any(s.get("id") in rpg_data.NEGATIVE_STATUS_IDS for s in defender.get("statuses", [])):
+            extra_mult *= float(sargs.get("mult", 1.3))
+
+    # —— E2：多段攻击，每段独立判定暴击/闪避 ——
+    hits = max(1, int(skill.get("hits", 1)))
     defender_after = dict(defender)
-    if not result.get("dodged"):
-        defender_after = _wake_on_hit(defender_after, rng)
-    defender_after["current_hp"] = max(0, int(defender_after.get("current_hp", defender["current_hp"])) - int(result["damage"]))
-    result.update(
-        {
-            "ok": True,
-            "skill": skill,
-            "attacker": attacker_after,
-            "defender": defender_after,
-            "defeated": int(defender_after["current_hp"]) <= 0,
-        }
-    )
-    return result
+    total_damage = 0
+    any_crit = False
+    any_hit = False
+    for _ in range(hits):
+        if int(defender_after.get("current_hp", 0)) <= 0:
+            break
+        hit = calculate_damage(
+            attacker_after,
+            defender_after,
+            damage_type=damage_type,
+            power_multiplier=power * extra_mult,
+            crit_multiplier=crit_mult,
+            defense_mult=defense_mult,
+            rng=rng,
+        )
+        if not hit.get("dodged"):
+            any_hit = True
+            defender_after = _wake_on_hit(defender_after, rng)
+        if hit.get("critical"):
+            any_crit = True
+        dmg = int(hit["damage"])
+        total_damage += dmg
+        defender_after = dict(defender_after)
+        defender_after["current_hp"] = max(0, int(defender_after.get("current_hp", defender["current_hp"])) - dmg)
+
+    # —— E1：伤害技附带自身增益 / 敌方减益（固定值，到期由 tick_statuses 自动撤销）——
+    self_buff = skill.get("self_buff")
+    if self_buff:
+        attacker_after = apply_buff(
+            attacker_after,
+            name=str(self_buff.get("name", skill.get("name", "增益"))),
+            mods=dict(self_buff.get("mods", {})),
+            duration=int(self_buff.get("duration", 2)),
+        )
+    enemy_debuff = skill.get("enemy_debuff")
+    if enemy_debuff:
+        defender_after = apply_buff(
+            defender_after,
+            name=str(enemy_debuff.get("name", skill.get("name", "削弱"))),
+            mods=dict(enemy_debuff.get("mods", {})),
+            duration=int(enemy_debuff.get("duration", 3)),
+        )
+    attacker_after = _apply_skill_mp_restore(attacker_after, skill)  # E3：回蓝（如安魂曲）
+
+    return {
+        "ok": True,
+        "skill": skill,
+        "attacker": attacker_after,
+        "defender": defender_after,
+        "damage": total_damage,
+        "critical": any_crit,
+        "dodged": not any_hit,
+        "hits": hits,
+        "defeated": int(defender_after["current_hp"]) <= 0,
+    }
+
+
+def _apply_skill_mp_restore(actor: dict[str, Any], skill: dict[str, Any]) -> dict[str, Any]:
+    """E3：技能回蓝（heal_mp_self 为按最大 MP 的百分比）。"""
+    if "heal_mp_self" not in skill:
+        return actor
+    actor = dict(actor)
+    max_mp = int(actor.get("stats", {}).get("mp", 0))
+    mp_back = int(max_mp * int(skill["heal_mp_self"]) / 100)
+    actor["current_mp"] = min(max_mp, int(actor.get("current_mp", max_mp)) + mp_back)
+    return actor
 
 
 def escape_rate(character: dict[str, Any], enemy: dict[str, Any]) -> float:
@@ -962,11 +1184,33 @@ def interrupt_rate(fast_actor: dict[str, Any], slow_actor: dict[str, Any]) -> fl
     return clamp((fast_spd - slow_spd) * 5 + luck, 0, 100)
 
 
-def random_event_outcome(luck: int, rng: random.Random) -> str:
-    positive_rate = clamp(20 + int(luck), 0, 99)
+def reputation_npc_weight_bonus(reputation: int) -> int:
+    reputation = int(reputation)
+    if reputation <= -500:
+        return -15
+    if reputation <= -200:
+        return -10
+    if reputation <= -50:
+        return -5
+    if reputation <= -1:
+        return -2
+    if reputation <= 19:
+        return 0
+    if reputation <= 49:
+        return 3
+    if reputation <= 199:
+        return 8
+    if reputation <= 499:
+        return 12
+    return 15
+
+
+def random_event_outcome(luck: int, rng: random.Random, reputation: int = 0) -> str:
+    reputation = int(reputation)
+    positive_rate = clamp(20 + int(luck) + max(-20, min(20, math.floor(reputation / 50))), 0, 99)
     if rng.random() * 100 < positive_rate:
         return "positive"
-    negative_rate = max(1, 40 - int(luck))
+    negative_rate = clamp(40 - int(luck) + max(-15, min(25, -math.floor(reputation / 50))), 1, 99)
     if rng.random() * 100 < negative_rate:
         return "negative"
     return "neutral"
@@ -1064,12 +1308,25 @@ def items_by_quality(quality: str, *, shop_only: bool = False) -> list[dict[str,
         for item in rpg_data.ITEM_POOLS
         if item.get("quality") == quality
         and item.get("price", 0) > 0
+        and not is_special_item(item)
         and (not shop_only or item.get("shop", True))
     ]
 
 
 def roll_item_by_quality(quality: str, rng: random.Random, *, shop_only: bool = False) -> dict[str, Any] | None:
     candidates = items_by_quality(quality, shop_only=shop_only)
+    if not candidates:
+        return None
+    return dict(rng.choice(candidates))
+
+
+def roll_special_item(rng: random.Random, *, shop_only: bool = False) -> dict[str, Any] | None:
+    candidates = [
+        dict(item) for item in rpg_data.ITEM_POOLS
+        if is_special_item(item)
+        and int(item.get("price", 0)) > 0
+        and (not shop_only or item.get("shop", True))
+    ]
     if not candidates:
         return None
     return dict(rng.choice(candidates))
@@ -1106,6 +1363,7 @@ def _roll_event_item(
     candidates = [
         item for item in rpg_data.ITEM_POOLS
         if item.get("quality") == quality and int(item.get("price", 0)) > 0
+        and not is_special_item(item)
     ]
     if only_consumable:
         candidates = [i for i in candidates if i.get("type") in ("food", "potion")]
@@ -1409,11 +1667,16 @@ def generate_shop_stock(
     for _ in range(count):
         score = shop_quality_score(luck, rng)
         quality = shop_quality_from_score(score)
-        item = roll_item_by_quality(quality, rng, shop_only=True)
+        item = roll_special_item(rng, shop_only=True) if rng.randint(1, 100) <= rpg_data.SPECIAL_ITEM_SHOP_CHANCE else None
+        if item is None:
+            item = roll_item_by_quality(quality, rng, shop_only=True)
         if item is None:
             item = dict(
                 rng.choice(
-                    [item for item in rpg_data.ITEM_POOLS if item.get("price", 0) > 0 and item.get("shop", True)]
+                    [
+                        item for item in rpg_data.ITEM_POOLS
+                        if item.get("price", 0) > 0 and item.get("shop", True) and not is_special_item(item)
+                    ]
                 )
             )
         item["quality_score"] = score
@@ -1429,6 +1692,7 @@ def quality_median_price(quality: str) -> int:
     prices = sorted(
         int(item["price"]) for item in rpg_data.ITEM_POOLS
         if item.get("quality") == quality and int(item.get("price", 0)) > 0 and item.get("shop", True)
+        and not is_special_item(item)
     )
     return prices[len(prices) // 2] if prices else 10
 
@@ -1438,6 +1702,7 @@ def roll_blind_item(quality: str, rng: random.Random) -> dict[str, Any] | None:
     candidates = [
         item for item in rpg_data.ITEM_POOLS
         if item.get("quality") == quality and int(item.get("price", 0)) > 0 and item.get("shop", True)
+        and not is_special_item(item)
     ]
     return dict(rng.choice(candidates)) if candidates else None
 
@@ -1469,7 +1734,10 @@ def generate_npc_shop(
             })
         return stock
 
-    pool = [item for item in rpg_data.ITEM_POOLS if int(item.get("price", 0)) > 0 and item.get("shop", True)]
+    pool = [
+        item for item in rpg_data.ITEM_POOLS
+        if int(item.get("price", 0)) > 0 and item.get("shop", True) and not is_special_item(item)
+    ]
     if types:
         pool = [item for item in pool if item.get("type") in set(types)]
     if qualities:
@@ -1513,21 +1781,34 @@ def boss_reward(boss_id: str, rng: random.Random) -> dict[str, Any]:
     }
 
 
-def generate_node_choices(chapter: dict[str, Any], rng: random.Random) -> list[dict[str, Any]]:
+def adjusted_node_weights_for_reputation(chapter: dict[str, Any], reputation: int) -> dict[str, int]:
+    weights = dict(chapter["node_weights"])
+    npc_bonus = reputation_npc_weight_bonus(reputation)
+    weights["npc"] = max(1, int(weights.get("npc", 0)) + npc_bonus)
+    if npc_bonus < 0:
+        weights["battle"] = int(weights.get("battle", 0)) + abs(npc_bonus) // 2
+        weights["mystery"] = int(weights.get("mystery", 0)) + abs(npc_bonus) // 2
+    elif npc_bonus > 0:
+        weights["battle"] = max(1, int(weights.get("battle", 0)) - npc_bonus // 3)
+    return weights
+
+
+def generate_node_choices(chapter: dict[str, Any], rng: random.Random, reputation: int = 0) -> list[dict[str, Any]]:
     choice_count = rng.randint(2, 3)
+    weights = adjusted_node_weights_for_reputation(chapter, reputation)
     choices: list[dict[str, Any]] = []
     for index in range(1, choice_count + 1):
-        node_type = weighted_choice(chapter["node_weights"], rng)
+        node_type = weighted_choice(weights, rng)
         choices.append({"index": index, "type": node_type})
     return choices
 
 
-def generate_run_map(rng: random.Random) -> dict[str, Any]:
+def generate_run_map(rng: random.Random, reputation: int = 0) -> dict[str, Any]:
     chapters: list[dict[str, Any]] = []
     for chapter in rpg_data.CHAPTER_DEFINITIONS:
         floor_count = rng.randint(int(chapter["min_floors"]), int(chapter["max_floors"]))
         floors = [
-            {"index": floor_index, "choices": generate_node_choices(chapter, rng)}
+            {"index": floor_index, "choices": generate_node_choices(chapter, rng, reputation)}
             for floor_index in range(1, floor_count + 1)
         ]
         floors.append(
@@ -1585,6 +1866,10 @@ def calculate_final_rewards(
     carry_out_item_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     multiplier = 1.0 if result == "victory" else 0.5
+    if result == "victory":
+        multiplier *= float(character.get("final_reward_multiplier", 1.0))
+    elif float(character.get("final_reward_multiplier", 1.0)) >= 2.0:
+        multiplier = 1.0
     run_exp = int(character.get("run_exp", 0))
     if run_exp <= 0:
         run_exp = int(character.get("exp", 0))

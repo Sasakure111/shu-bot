@@ -92,6 +92,10 @@ async def handle_menu(event: MessageEvent):
 
 🐾 宠物
   /宠物                (查看宠物功能菜单)
+
+⚔️ RPG游戏
+  /冒险                (进入RPG冒险)
+  /玩家                (查看局外玩家信息)
 """
     await menu_cmd.finish(menu_text)
 

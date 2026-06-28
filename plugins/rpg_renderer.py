@@ -42,6 +42,19 @@ def _item_name(item_id: str) -> str:
         return item_id
 
 
+def _format_item_counts(item_ids: list[str]) -> str:
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for item_id in item_ids:
+        if item_id not in counts:
+            order.append(item_id)
+        counts[item_id] = counts.get(item_id, 0) + 1
+    return "、".join(
+        _item_name(item_id) if counts[item_id] == 1 else f"{_item_name(item_id)} x{counts[item_id]}"
+        for item_id in order
+    )
+
+
 def _skill_name(skill_id: str) -> str:
     try:
         return rpg_engine.get_skill_template(skill_id)["name"]
@@ -160,6 +173,73 @@ def render_character_card(character: dict[str, Any]) -> str:
     )
 
 
+def render_outside_player_profile(
+    player: dict[str, Any],
+    *,
+    player_name: str,
+    next_exp: int | None,
+    gm_welcome: str,
+) -> str:
+    exp_text = "MAX" if next_exp is None else f"{int(player['exp'])} / {next_exp}"
+    return (
+        f"【冒险者】 <{player_name}>\n"
+        f"【等级】 Lv. {int(player['level'])}（{exp_text}）\n"
+        f"【声望】{player['title']} ：{int(player['reputation'])}\n\n"
+        "【背包】\n"
+        "*使用 /背包 查看详情。\n"
+        "【成就】\n"
+        "*使用 /成就书 查看成就。\n\n"
+        f"AI GM：{gm_welcome}"
+    )
+
+
+def render_outside_inventory(items: list[Any]) -> str:
+    lines = ["【局外背包】", "容量：无上限"]
+    if not items:
+        lines.append("背包为空。通关后可带出特殊道具和 Boss 纪念品。")
+        return "\n".join(lines)
+
+    for index, row in enumerate(items, 1):
+        item_id = row["item_id"]
+        quantity = int(row["quantity"])
+        try:
+            item = rpg_engine.get_item_template(item_id)
+            name = item["name"]
+            item_type = item.get("type", "item")
+            description = item.get("description", "")
+        except ValueError:
+            name = str(item_id)
+            item_type = "未知"
+            description = "旧版本收藏品。"
+        lines.append(f"{index}. [{item_type}] {name} x{quantity}")
+        if description:
+            lines.append(f"   {description}")
+    return "\n".join(lines)
+
+
+def render_achievement_book(unlocked_ids: set[str], *, player_name: str) -> str:
+    from . import rpg_achievements
+
+    total = len(rpg_achievements.ACHIEVEMENTS)
+    got = sum(1 for a in rpg_achievements.ACHIEVEMENTS if a["id"] in unlocked_ids)
+    lines = [
+        f"【成就书】 <{player_name}>",
+        f"进度：{got} / {total}",
+        "",
+    ]
+    for ach in rpg_achievements.ACHIEVEMENTS:
+        unlocked = ach["id"] in unlocked_ids
+        mark = "✅" if unlocked else "🔒"
+        if ach["hidden"] and not unlocked:
+            # 隐藏成就未解锁：不剧透名称与条件
+            lines.append(f"{mark} #{ach['id']} 【隐藏成就】 ？？？")
+            continue
+        name = ("【隐藏】" if ach["hidden"] else "") + ach["name"]
+        lines.append(f"{mark} #{ach['id']} {name}")
+        lines.append(f"    {ach['desc']}")
+    return "\n".join(lines)
+
+
 def render_background_ready(character: dict[str, Any]) -> str:
     return (
         f"AI GM 为 {character['class_name']} 写下了开场背景：\n"
@@ -184,15 +264,15 @@ def render_floor_choices(
             node_name = f"Boss：{boss['name']}"
         lines.append(f"{choice['index']}：{node_name}")
     lines.append("发送 /<编号> 选择事件，例如 /1。")
-    lines.append("可用：/查看背包 /查看面板 /装备 /卸下 /转生")
+    lines.append("可用：/查看背包 /查看面板 /装备 /卸下 /遗忘 /转生")
     return "\n".join(lines)
 
 
-def render_inventory(character: dict[str, Any]) -> str:
+def render_inventory(character: dict[str, Any], in_page: bool = False) -> str:
     inventory = character.get("inventory", [])
     equipment = character.get("equipment", [])
     lines = [
-        f"背包 {len(inventory)}/{rpg_data.MAX_BACKPACK_SLOTS} | 金币：{character.get('gold', 0)}"
+        f"背包 {len(inventory)}/{rpg_engine.inventory_backpack_slots(character)} | 金币：{character.get('gold', 0)}"
     ]
     if equipment:
         worn = "、".join(f"{i}.{_item_name(entry['id'])}" for i, entry in enumerate(equipment, 1))
@@ -204,11 +284,21 @@ def render_inventory(character: dict[str, Any]) -> str:
     else:
         for index, entry in enumerate(inventory, 1):
             item = rpg_engine.get_item_template(entry["id"])
-            tag = CATEGORY_TAGS.get(rpg_engine.item_category(item), "道具")
+            if item.get("type") == "skillbook":
+                tag = "技能书"
+            elif rpg_engine.is_special_item(item):
+                tag = "特殊"
+            else:
+                tag = CATEGORY_TAGS.get(rpg_engine.item_category(item), "道具")
             lines.append(
                 f"{index}. [{tag}] {item['name']} x{entry.get('quantity', 1)} - {item.get('description', '')}"
             )
     lines.append("可用：/装备 <编号> /卸下 <编号>")
+    if in_page:
+        # 背包二级页：明确局外用法，并提示这是独立页面、需 /返回 退出
+        lines.append("局外使用：发送 /<编号> 使用对应编号的【消耗】道具，或翻阅【技能书】学会技能。")
+        lines.append("【属性】道具（饰品）持有即被动生效，无需主动使用；【装备】请用 /装备 <编号> 穿戴。")
+        lines.append("发送 /返回 收起背包，回到当前层继续冒险。")
     return "\n".join(lines)
 
 
@@ -236,6 +326,25 @@ def render_attack_result(attacker_name: str, defender_name: str, result: dict[st
     if result.get("defeated"):
         text += f"\n{defender_name} 被击败了。"
     return text
+
+
+def render_skills(character: dict[str, Any]) -> str:
+    """技能栏一览（带编号，供 /遗忘 与学习反馈使用）。"""
+    skills = character.get("skills", [])
+    lines = [f"技能栏 {len(skills)}/{rpg_data.MAX_SKILL_SLOTS}："]
+    if not skills:
+        lines.append("（空）")
+    for index, skill_id in enumerate(skills, 1):
+        try:
+            skill = rpg_engine.get_skill_template(skill_id)
+        except ValueError:
+            lines.append(f"{index}. {skill_id}")
+            continue
+        innate = "（出生技）" if skill.get("innate") else ""
+        lines.append(
+            f"{index}. {skill['name']}{innate} | MP{skill.get('mp_cost', 0)} | {skill.get('description', '')}"
+        )
+    return "\n".join(lines)
 
 
 def render_skill_list(character: dict[str, Any]) -> str:
@@ -288,7 +397,7 @@ def render_reward(reward: dict[str, Any]) -> str:
             lines.append(f"获得道具：{item['name']}。")
     carry_out = reward.get("carry_out", [])
     if carry_out:
-        lines.append("可带出收藏：" + "、".join(_item_name(item_id) for item_id in carry_out))
+        lines.append("可带出收藏：" + _format_item_counts(carry_out))
     return "\n".join(lines)
 
 
@@ -308,7 +417,13 @@ def render_final_rewards(final_rewards: dict[str, Any]) -> str:
         f"获得局外玩家经验：{final_rewards['outside_exp']}",
         f"获得局外声望：{final_rewards['outside_reputation']}",
     ]
+    outside_player = final_rewards.get("outside_player")
+    if outside_player:
+        next_exp = outside_player.get("next_exp")
+        exp_text = "MAX" if next_exp is None else f"{outside_player['exp']} / {next_exp}"
+        lines.append(f"局外玩家等级：Lv.{outside_player['level']}（{exp_text}）")
+        lines.append(f"局外声望：{outside_player['reputation']}（{outside_player.get('title', '籍籍无名')}）")
     carry_out = final_rewards.get("carry_out_items", [])
     if carry_out:
-        lines.append("带出局外收藏：" + "、".join(_item_name(item_id) for item_id in carry_out))
+        lines.append("带出局外收藏：" + _format_item_counts(carry_out))
     return "\n".join(lines)

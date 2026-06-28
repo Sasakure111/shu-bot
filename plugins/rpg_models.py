@@ -38,11 +38,27 @@ class SkillTemplate(TypedDict, total=False):
     id: str
     name: str
     type: DamageType
+    quality: str  # 品质（决定技能书掉落/价格/强度档；不参与结算，纯标签）
+    class_req: str | None  # 职业限定 id；None=通用技
+    innate: bool  # True=出生技，不作为技能书掉落/出售
     mp_cost: int
-    power: float
+    power: float  # 伤害技：伤害倍率（作用于 ATK/MAT）；支援治疗技：治疗倍率（作用于 MAT）
+    hits: int  # 多段攻击次数，默认 1
     description: str
     status: str
     status_chance: int
+    status_pool: list[str]  # 随机异常池：命中时从中挑一个附加（与 status 二选一）
+    # 限时增益（固定数值，与道具 buff 同口径，作用于核心/骰子属性）。
+    # support 技与伤害技均可带；伤害技的 self_buff/enemy_debuff 在伤害结算后施加。
+    self_buff: dict[str, object]  # {"name": str, "mods": {stat: int}, "duration": int} 施于自身
+    enemy_debuff: dict[str, object]  # {"name": str, "mods": {stat: -int}, "duration": int} 施于敌人
+    # 治疗 / 回蓝（百分比按各自最大值；heal_hp_flat 为定额、不吃 MAT）
+    heal_hp_percent: int
+    heal_hp_flat: int
+    heal_mp_self: int  # 回自身 MP，按最大 MP 的百分比
+    # 传奇特殊机制钩子
+    special: str  # low_hp_bonus / execute / crit_override / pierce_def / smite_status
+    special_args: dict[str, object]
 
 
 class ClassTemplate(TypedDict, total=False):

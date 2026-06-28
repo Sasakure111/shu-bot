@@ -10,14 +10,20 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Message, MessageEvent
 from nonebot.params import CommandArg
 
-from . import rpg_data, rpg_engine, rpg_renderer
+from . import rpg_achievements, rpg_ai, rpg_data, rpg_engine, rpg_renderer
 from .database import (
-    add_rpg_player_progress,
+    add_rpg_player_items,
     create_rpg_run,
     decode_rpg_run_state,
     finish_rpg_run,
     get_active_rpg_run,
+    get_rpg_player,
+    list_rpg_achievements,
+    list_rpg_player_items,
+    rpg_player_exp_to_next_level,
     save_rpg_run_state,
+    set_rpg_player_gm_welcome,
+    unlock_rpg_achievement,
 )
 from .message_utils import reply_message, should_ignore_group_message
 
@@ -100,12 +106,15 @@ def _save_state(state: dict[str, Any]) -> dict[str, Any]:
 ADD_ITEM_FAIL_REASONS = {
     "backpack_full": "背包已满",
     "duplicate_equipment": "同名装备只能持有一件",
+    "duplicate_special": "同名特殊道具只能持有一件",
     "stack_full": "该道具已堆满",
 }
 
 
 def _append_inventory(character: dict[str, Any], item_id: str) -> bool:
     ok, _reason = rpg_engine.add_item_to_inventory(character, item_id)
+    if ok:
+        _sync_special_passives(character)
     return ok
 
 
@@ -117,6 +126,222 @@ def _consume_entry(character: dict[str, Any], entry: dict[str, Any]) -> dict[str
     else:
         entry["quantity"] = quantity
     return item
+
+
+def _is_outside_collectible(item: dict[str, Any]) -> bool:
+    return item.get("quality") == "special" or item.get("type") in {"special", "keepsake", "certificate"}
+
+
+def _outside_dimension_pocket_bonus(user_id: int) -> int:
+    return sum(
+        int(row["quantity"]) for row in list_rpg_player_items(user_id)
+        if row["item_id"] == "dimension_pocket"
+    )
+
+
+def _outside_genesis_multiplier(user_id: int) -> float:
+    count = sum(
+        int(row["quantity"]) for row in list_rpg_player_items(user_id)
+        if row["item_id"] == "genesis_record"
+    )
+    return min(1.6, 1.0 + 0.2 * count)
+
+
+def _sync_special_passives(character: dict[str, Any], user_id: int | None = None) -> dict[str, Any]:
+    outside_bonus = _outside_dimension_pocket_bonus(user_id) if user_id is not None else int(character.get("outside_backpack_slot_bonus", 0))
+    local_bonus = 0
+    for entry in character.get("inventory", []):
+        if entry.get("id") == "dimension_pocket":
+            local_bonus += int(entry.get("quantity", 1))
+    total_bonus = min(
+        rpg_data.MAX_BACKPACK_SLOTS_WITH_BONUS - rpg_data.MAX_BACKPACK_SLOTS,
+        max(0, outside_bonus + local_bonus),
+    )
+    character["outside_backpack_slot_bonus"] = max(0, outside_bonus)
+    character["backpack_slot_bonus"] = total_bonus
+    if user_id is not None:
+        character["final_reward_multiplier"] = max(
+            float(character.get("final_reward_multiplier", 1.0)),
+            _outside_genesis_multiplier(user_id),
+        )
+    return character
+
+
+def _has_item(character: dict[str, Any], item_id: str) -> bool:
+    return any(entry.get("id") == item_id for entry in character.get("inventory", []))
+
+
+def _consume_item_by_id(character: dict[str, Any], item_id: str) -> bool:
+    for entry in list(character.get("inventory", [])):
+        if entry.get("id") == item_id:
+            _consume_entry(character, entry)
+            _sync_special_passives(character)
+            return True
+    return False
+
+
+def _special_shop_discount(character: dict[str, Any]) -> int:
+    return 20 if _has_item(character, "merchant_token") else 0
+
+
+def _render_current_floor_reveal(state: dict[str, Any], *, details: bool = False) -> str:
+    lines = ["当前层情报："]
+    for choice in _current_floor_choices(state):
+        node_type = choice["type"]
+        node_name = rpg_renderer.NODE_NAMES.get(node_type, node_type)
+        if node_type == "boss":
+            boss = rpg_engine.get_boss_template(choice["boss_id"])
+            node_name = f"Boss：{boss['name']} Lv.{boss['level']}"
+        elif details and node_type in {"battle", "elite"}:
+            rank = "精英或更强" if node_type == "elite" else "普通敌人"
+            node_name = f"{node_name}（{rank}）"
+        lines.append(f"{choice['index']}：{node_name}")
+    return "\n".join(lines)
+
+
+def _render_enemy_details(enemy: dict[str, Any]) -> str:
+    stats = enemy.get("stats", {})
+    return (
+        f"【{enemy.get('name', '敌人')}】Lv.{enemy.get('level', '?')} {enemy.get('rank_name', '')}\n"
+        f"HP {enemy.get('current_hp', stats.get('hp', 0))}/{stats.get('hp', 0)} | MP {enemy.get('current_mp', stats.get('mp', 0))}/{stats.get('mp', 0)}\n"
+        f"ATK {stats.get('atk', 0)} | DEF {stats.get('def', 0)} | MAT {stats.get('mat', 0)} | MDF {stats.get('mdf', 0)} | SPD {stats.get('spd', 0)}\n"
+        f"技能：{'、'.join(enemy.get('skills', [])) or '无'}"
+    )
+
+
+def _learn_random_skill(character: dict[str, Any], rng: random.Random) -> tuple[dict[str, Any], str]:
+    known = set(character.get("skills", []))
+    class_id = character.get("class_id")
+    candidates = [
+        skill for skill in rpg_data.BASE_SKILLS
+        if not skill.get("innate")
+        and skill["id"] not in known
+        and skill.get("class_req") in (None, class_id)
+    ]
+    if not candidates:
+        return character, "没有可学习的新技能。"
+    skill = rng.choice(candidates)
+    ok, reason = rpg_engine.learn_skill(character, skill["id"])
+    if ok:
+        return character, f"学会了技能【{skill['name']}】。"
+    if reason == "slots_full":
+        return character, f"技能栏已满，无法学习【{skill['name']}】。"
+    return character, "未能学习新技能。"
+
+
+def _handle_active_special_item(
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    item: dict[str, Any],
+    rng: random.Random,
+) -> str | None:
+    if not rpg_engine.is_active_special_item(item):
+        return None
+    effect = rpg_engine.special_effect_id(item)
+    character = state["character"]
+    consume = True
+    lines = [f"使用了 {item['name']}。"]
+
+    if effect == "reveal_nodes":
+        lines.append(_render_current_floor_reveal(state))
+    elif effect == "reveal_details":
+        lines.append(_render_current_floor_reveal(state, details=True))
+    elif effect == "inspect_enemy":
+        enemy = state.get("flags", {}).get("enemy")
+        if not enemy:
+            return "这个道具需要在战斗中使用。"
+        lines.append(_render_enemy_details(enemy))
+    elif effect == "battle_escape":
+        enemy = state.get("flags", {}).get("enemy")
+        if not enemy:
+            return "这个道具需要在战斗中使用。"
+        if enemy.get("rank") == "boss":
+            return "Boss 战无法使用传送卷轴逃跑。"
+        state["flags"].pop("enemy", None)
+        state["flags"].pop("bounty_reward", None)
+        state["character"] = _clear_combat_statuses(character)
+        _consume_entry(state["character"], entry)
+        _sync_special_passives(state["character"])
+        return "\n".join(lines + ["传送成功，你脱离了战斗。", _render_current_floor_or_finish(state)])
+    elif effect == "learn_random_skill":
+        character, line = _learn_random_skill(character, rng)
+        state["character"] = character
+        lines.append(line)
+    elif effect in {"abyss_contract", "reroll_random_keep_best", "final_reward_multiplier"}:
+        character, eff_lines = rpg_engine.apply_consumable_effects(character, item, rng)
+        state["character"] = character
+        lines.extend(eff_lines)
+    elif effect == "skip_floor":
+        chapter_key = str(state.get("chapter", 0))
+        used = state["flags"].setdefault("world_key_used_chapters", [])
+        if chapter_key in used:
+            return "世界之钥本章已经使用过了。"
+        used.append(chapter_key)
+        consume = False
+        state["flags"].pop("enemy", None)
+        state["character"] = _clear_combat_statuses(character)
+        return "\n".join(lines + ["世界之钥打开了捷径。", _render_current_floor_or_finish(state)])
+    elif effect == "steal_next_enemy_skill":
+        state["flags"]["soul_gem_active"] = True
+        lines.append("灵魂宝石开始发光：下一次击杀敌人时会尝试夺取一个技能。")
+    elif effect == "rewind_round":
+        return "时光沙漏需要战斗回合快照，当前版本暂未接入，不会消耗。"
+    else:
+        return f"{item['name']} 的特殊效果暂未接入。"
+
+    if consume:
+        _consume_entry(state["character"], entry)
+        _sync_special_passives(state["character"])
+    _save_state(state)
+    return "\n".join(lines)
+
+
+def _try_special_revive(state: dict[str, Any]) -> str | None:
+    character = state["character"]
+    if int(character.get("current_hp", 0)) > 0:
+        return None
+    candidates = [
+        ("phoenix_feather", "不死鸟羽毛", 50, "phoenix_feather_used"),
+        ("life_anchor", "生命锚", 30, "life_anchor_used"),
+    ]
+    for item_id, name, heal_pct, flag in candidates:
+        if state["flags"].get(flag) or not _has_item(character, item_id):
+            continue
+        max_hp = max(1, int(character.get("stats", {}).get("hp", 1)))
+        character["current_hp"] = max(1, max_hp * heal_pct // 100)
+        state["flags"][flag] = True
+        return f"{name}触发：你从濒死中回归，回复 {character['current_hp']} HP。"
+    return None
+
+
+def _enemy_followup_after_item(state: dict[str, Any], rng: random.Random) -> dict[str, Any]:
+    enemy = state.get("flags", {}).get("enemy")
+    if not enemy:
+        return {"outcome": "continue", "lines": []}
+    character = state["character"]
+    action = rpg_engine.choose_enemy_action(enemy, rng)
+    enemy_after, character_after, lines = _execute_action(enemy, character, action, enemy.get("name", "敌人"), "你", rng)
+    state["flags"]["enemy"] = enemy_after
+    state["character"] = character_after
+    outcome = "player_defeated" if int(character_after.get("current_hp", 0)) <= 0 else "continue"
+    if outcome == "player_defeated":
+        revive_line = _try_special_revive(state)
+        if revive_line:
+            lines.append(revive_line)
+            outcome = "continue"
+    return {"outcome": outcome, "lines": lines, "item_used": False}
+
+
+def _collect_outside_item_ids(character: dict[str, Any], carry_out: list[str]) -> list[str]:
+    item_ids = list(carry_out)
+    for entry in character.get("inventory", []):
+        try:
+            item = rpg_engine.get_item_template(entry["id"])
+        except ValueError:
+            continue
+        if _is_outside_collectible(item):
+            item_ids.extend([str(entry["id"])] * max(1, int(entry.get("quantity", 1))))
+    return item_ids
 
 
 def _fallback_background(character: dict[str, Any]) -> str:
@@ -164,15 +389,65 @@ def _advance_floor(state: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     return state, None
 
 
+def _ach_counters(state: dict[str, Any]) -> dict[str, Any]:
+    """取（必要时初始化）本局成就计数器，挂在 state['flags']['ach'] 上随存档持久化。"""
+    return state.setdefault("flags", {}).setdefault("ach", rpg_achievements.new_run_counters())
+
+
+def _record_social_attempt(state: dict[str, Any], action: str, success: bool) -> None:
+    """记录一次社交判定（说服/欺骗/威吓）的成败，用于社交类成就。"""
+    key = {"说服": "persuade", "欺骗": "deceive", "威吓": "intimidate"}.get(action)
+    if key is None:
+        return
+    counter = _ach_counters(state).setdefault(key, {"n": 0, "ok": 0})
+    counter["n"] += 1
+    if success:
+        counter["ok"] += 1
+
+
+def _evaluate_achievements(state: dict[str, Any], result: str) -> list[str]:
+    """一局结束时比对全部成就，落库首次解锁的，返回用于提示的成就名列表。
+
+    须在 finish_rpg_run / add_rpg_player_items 之后调用：
+    #1~#4 依赖刷新后的累计通关数，#22 依赖刚带出的纪念物。
+    """
+    user_id = int(state["user_id"])
+    character = state.get("character", {})
+    random_stats = character.get("random_stats", {})
+    player = get_rpg_player(user_id)
+    owned_keepsakes = {row["item_id"] for row in list_rpg_player_items(user_id)}
+    ctx = {
+        "result": result,
+        "won": result == "victory",
+        "wins": int(player["wins"]),
+        "charm": int(random_stats.get("charm", 0)),
+        "luck": int(random_stats.get("luck", 0)),
+        # 旧版进行中的存档没记 start_luck，给个大值避免误判隐藏成就 #5
+        "start_luck": int(state.get("flags", {}).get("start_luck", 999)),
+        "run_statuses": list(character.get("run_statuses", [])),
+        "ach": _ach_counters(state),
+        "owned_keepsakes": owned_keepsakes,
+    }
+    already = list_rpg_achievements(user_id)
+    unlocked_names: list[str] = []
+    for ach_id in rpg_achievements.evaluate(ctx):
+        if ach_id in already:
+            continue
+        if unlock_rpg_achievement(user_id, ach_id):
+            unlocked_names.append(rpg_achievements.ACHIEVEMENTS_BY_ID[ach_id]["name"])
+    return unlocked_names
+
+
 def _finish_run(state: dict[str, Any], result: str) -> str:
     character = state.get("character", {})
     carry_out = state.get("flags", {}).get("carry_out_items", [])
+    outside_item_ids = _collect_outside_item_ids(character, carry_out) if result == "victory" else []
     final_rewards = rpg_engine.calculate_final_rewards(
         character,
         result=result,
-        carry_out_item_ids=carry_out,
+        carry_out_item_ids=outside_item_ids,
     )
-    finish_rpg_run(
+    finished_run = finish_rpg_run(
         int(state["id"]),
         result,
         exp_amount=int(final_rewards["outside_exp"]),
@@ -180,12 +455,23 @@ def _finish_run(state: dict[str, Any], result: str) -> str:
         won=result == "victory",
         died=result == "death",
     )
-    add_rpg_player_progress(
-        int(state["user_id"]),
-        exp_amount=0,
-        reputation_delta=0,
-    )
-    return rpg_renderer.render_final_rewards(final_rewards)
+    if finished_run is None:
+        return "本局已经完成结算，请发送 /冒险 开始新的旅程。"
+    add_rpg_player_items(int(state["user_id"]), outside_item_ids)
+    player = get_rpg_player(int(state["user_id"]))
+    final_rewards["outside_player"] = {
+        "level": int(player["level"]),
+        "exp": int(player["exp"]),
+        "next_exp": rpg_player_exp_to_next_level(int(player["level"])),
+        "reputation": int(player["reputation"]),
+        "title": str(player["title"]),
+    }
+    state["_run_finished"] = result  # 供异步层检测本局是否刚结束（用于 AI 结局旁白）
+    text = rpg_renderer.render_final_rewards(final_rewards)
+    unlocked = _evaluate_achievements(state, result)
+    if unlocked:
+        text += "\n\n🏆 解锁成就：" + "、".join(unlocked)
+    return text
 
 
 def _render_current_floor_or_finish(state: dict[str, Any]) -> str:
@@ -291,6 +577,8 @@ def _state_prompt(state: dict[str, Any]) -> str:
         return rpg_renderer.render_character_card(state["character"])
     if status == "floor_select":
         return rpg_renderer.render_floor_choices(state["map"], int(state["chapter"]), int(state["floor"]))
+    if status == "inventory":
+        return rpg_renderer.render_inventory(state["character"], in_page=True)
     if status == "battle":
         return rpg_renderer.render_battle_state(state["character"], state["flags"]["enemy"])
     if status == "shop":
@@ -300,8 +588,41 @@ def _state_prompt(state: dict[str, Any]) -> str:
     return "当前冒险正在进行。可用 /查看面板、/查看背包，或按当前提示继续。"
 
 
+def _event_display_name(event: MessageEvent) -> str:
+    sender = getattr(event, "sender", None)
+    for key in ("card", "nickname"):
+        if isinstance(sender, dict):
+            value = sender.get(key)
+        else:
+            value = getattr(sender, key, None) if sender is not None else None
+        if value:
+            return str(value)
+    return str(event.user_id)
+
+
+async def _daily_player_welcome(event: MessageEvent, player: Any, player_name: str) -> tuple[dict[str, Any], str]:
+    today = datetime.now().date().isoformat()
+    player_data = dict(player)
+    if player_data.get("gm_welcome_date") == today and player_data.get("gm_welcome_text"):
+        return player_data, str(player_data["gm_welcome_text"])
+
+    welcome = await rpg_ai.narrate_player_welcome(
+        player_name,
+        str(player_data["title"]),
+        int(player_data["level"]),
+        int(player_data["reputation"]),
+    )
+    if not welcome:
+        welcome = "冒险者，今天要开始冒险了吗？"
+    player_data = dict(set_rpg_player_gm_welcome(event.user_id, today, welcome))
+    return player_data, welcome
+
+
 rules_cmd = on_command("规则", priority=4, block=True)
 adventure_cmd = on_command("冒险", aliases={"rpg"}, priority=4, block=True)
+player_cmd = on_command("玩家", priority=4, block=True)
+outside_bag_cmd = on_command("背包", priority=4, block=True)
+achievement_book_cmd = on_command("成就书", aliases={"成就"}, priority=4, block=True)
 standard_cmd = on_command("标准模式", priority=4, block=True)
 creative_cmd = on_command("创意模式", priority=4, block=True)
 mode_intro_cmd = on_command("模式简介", priority=4, block=True)
@@ -325,6 +646,7 @@ buy_cmd = on_command("购买", priority=4, block=True)
 exit_shop_cmd = on_command("退出商店", priority=4, block=True)
 equip_cmd = on_command("装备", priority=4, block=True)
 unequip_cmd = on_command("卸下", priority=4, block=True)
+forget_cmd = on_command("遗忘", priority=4, block=True)
 social_cmds = {
     "说服": on_command("说服", priority=4, block=True),
     "欺骗": on_command("欺骗", priority=4, block=True),
@@ -350,6 +672,44 @@ async def handle_adventure(event: MessageEvent):
     await adventure_cmd.finish(reply_message(event, _state_prompt(state)))
 
 
+@player_cmd.handle()
+async def handle_player(event: MessageEvent):
+    if should_ignore_group_message(event):
+        return
+    player = get_rpg_player(event.user_id)
+    player_name = _event_display_name(event)
+    player_data, welcome = await _daily_player_welcome(event, player, player_name)
+    await player_cmd.finish(reply_message(
+        event,
+        rpg_renderer.render_outside_player_profile(
+            player_data,
+            player_name=player_name,
+            next_exp=rpg_player_exp_to_next_level(int(player_data["level"])),
+            gm_welcome=welcome,
+        ),
+    ))
+
+
+@outside_bag_cmd.handle()
+async def handle_outside_bag(event: MessageEvent):
+    if should_ignore_group_message(event):
+        return
+    items = list_rpg_player_items(event.user_id)
+    await outside_bag_cmd.finish(reply_message(event, rpg_renderer.render_outside_inventory(items)))
+
+
+@achievement_book_cmd.handle()
+async def handle_achievement_book(event: MessageEvent):
+    if should_ignore_group_message(event):
+        return
+    get_rpg_player(event.user_id)
+    unlocked = list_rpg_achievements(event.user_id)
+    await achievement_book_cmd.finish(reply_message(
+        event,
+        rpg_renderer.render_achievement_book(unlocked, player_name=_event_display_name(event)),
+    ))
+
+
 @standard_cmd.handle()
 async def handle_standard(event: MessageEvent):
     if should_ignore_group_message(event):
@@ -367,6 +727,11 @@ async def handle_standard(event: MessageEvent):
         state = decode_rpg_run_state(get_active_rpg_run(event.user_id))
         state["id"] = run_id
     else:
+        if state["status"] not in {"mode_select", "standard_menu"}:
+            await standard_cmd.finish(reply_message(
+                event,
+                "当前冒险已经开始，不能重新进入标准模式。\n" + _state_prompt(state),
+            ))
         state["status"] = "standard_menu"
         state = _save_state(state)
     await standard_cmd.finish(reply_message(event, rpg_renderer.render_standard_menu()))
@@ -492,9 +857,16 @@ async def handle_start_adventure(event: MessageEvent):
         await start_adventure_cmd.finish(reply_message(event, "冒险已经开始，无法重复出发。发送 /查看面板 继续。"))
     rng = _rng_for_run(state, "map")
     character = state["character"]
-    character["background"] = _fallback_background(character)
+    character = _sync_special_passives(character, event.user_id)
+    character["background"] = await rpg_ai.narrate_opening(character) or _fallback_background(character)
     state["character"] = character
-    state["map"] = rpg_engine.generate_run_map(rng)
+    player = get_rpg_player(event.user_id)
+    state["flags"]["start_reputation"] = int(player["reputation"])
+    state["flags"]["start_reputation_title"] = str(player["title"])
+    # 记录开局幸运值（用于隐藏成就 #5），并初始化本局成就计数器
+    state["flags"]["start_luck"] = int(character.get("random_stats", {}).get("luck", 0))
+    state["flags"]["ach"] = rpg_achievements.new_run_counters()
+    state["map"] = rpg_engine.generate_run_map(rng, int(player["reputation"]))
     state["chapter"] = 0
     state["floor"] = 0
     state["status"] = "floor_select"
@@ -524,6 +896,14 @@ async def handle_inventory(event: MessageEvent):
     state = _load_state(event.user_id)
     if state is None or not state.get("character"):
         await inventory_cmd.finish(reply_message(event, "当前没有冒险背包。"))
+    # 仅在层间探索（floor_select）这一局外枢纽进入背包二级页，可 /<编号> 使用消耗品、/返回 回到当前层。
+    # 其它状态（战斗 / 商店 / 事件 / 出售 / 确认等）只读查看，避免打断当前交互。
+    if state["status"] in {"floor_select", "inventory"}:
+        if state["status"] != "inventory":
+            state["flags"]["inventory_return"] = state["status"]
+            state["status"] = "inventory"
+            _save_state(state)
+        await inventory_cmd.finish(reply_message(event, rpg_renderer.render_inventory(state["character"], in_page=True)))
     await inventory_cmd.finish(reply_message(event, rpg_renderer.render_inventory(state["character"])))
 
 
@@ -550,7 +930,8 @@ async def handle_equip(event: MessageEvent, args: Message = CommandArg()):
         await equip_cmd.finish(reply_message(event, msg))
     state["character"] = character
     _save_state(state)
-    await equip_cmd.finish(reply_message(event, f"已装备 {item['name']}。\n" + rpg_renderer.render_inventory(character)))
+    in_page = state["status"] == "inventory"
+    await equip_cmd.finish(reply_message(event, f"已装备 {item['name']}。\n" + rpg_renderer.render_inventory(character, in_page=in_page)))
 
 
 @unequip_cmd.handle()
@@ -570,12 +951,43 @@ async def handle_unequip(event: MessageEvent, args: Message = CommandArg()):
     if not ok:
         msg = {
             "no_item": "没有这个装备编号。",
-            "backpack_full": f"背包已满（上限 {rpg_data.MAX_BACKPACK_SLOTS} 格），无法卸下。",
+            "backpack_full": (
+                f"背包已满（上限 {rpg_engine.inventory_backpack_slots(character)} 格），无法卸下。"
+            ),
         }.get(reason, "无法卸下该装备。")
         await unequip_cmd.finish(reply_message(event, msg))
     state["character"] = character
     _save_state(state)
-    await unequip_cmd.finish(reply_message(event, f"已卸下 {item['name']}。\n" + rpg_renderer.render_inventory(character)))
+    in_page = state["status"] == "inventory"
+    await unequip_cmd.finish(reply_message(event, f"已卸下 {item['name']}。\n" + rpg_renderer.render_inventory(character, in_page=in_page)))
+
+
+@forget_cmd.handle()
+async def handle_forget(event: MessageEvent, args: Message = CommandArg()):
+    if should_ignore_group_message(event):
+        return
+    state = _load_state(event.user_id)
+    if state is None or not state.get("character"):
+        await forget_cmd.finish(reply_message(event, "当前没有冒险角色。"))
+    if state["status"] in BATTLE_STATUSES or state["status"] == "confirm":
+        await forget_cmd.finish(reply_message(event, "战斗中无法遗忘技能。"))
+    character = state["character"]
+    text = args.extract_plain_text().strip()
+    if not text.isdigit():
+        await forget_cmd.finish(reply_message(
+            event, "用法：/遗忘 <技能编号>（不返还）。\n" + rpg_renderer.render_skills(character)
+        ))
+    ok, reason, name = rpg_engine.forget_skill(character, int(text) - 1)
+    if not ok:
+        msg = {
+            "no_skill": "没有这个技能编号。",
+            "last_skill": "至少要保留 1 个技能，无法再遗忘。",
+            "innate": f"出生技【{name}】不能遗忘。",
+        }.get(reason, "无法遗忘该技能。")
+        await forget_cmd.finish(reply_message(event, msg + "\n" + rpg_renderer.render_skills(character)))
+    state["character"] = character
+    _save_state(state)
+    await forget_cmd.finish(reply_message(event, f"已遗忘【{name}】。\n" + rpg_renderer.render_skills(character)))
 
 
 @rebirth_cmd.handle()
@@ -598,6 +1010,11 @@ async def handle_return(event: MessageEvent):
     state = _load_state(event.user_id)
     if state is None:
         await return_cmd.finish(reply_message(event, "当前没有可返回的冒险菜单。"))
+    # 背包二级页：直接收起回到进入前的状态，无需二次确认
+    if state["status"] == "inventory":
+        state["status"] = state["flags"].pop("inventory_return", "floor_select")
+        _save_state(state)
+        await return_cmd.finish(reply_message(event, "你收起了背包。\n" + _state_prompt(state)))
     target = RETURN_TARGETS.get(state["status"])
     if target is None:
         await return_cmd.finish(reply_message(event, "当前状态不能返回上一级。"))
@@ -637,7 +1054,11 @@ async def handle_yes(event: MessageEvent):
         _save_state(state)
         await yes_cmd.finish(reply_message(event, _state_prompt(state)))
     if action["type"] == "rebirth":
-        await yes_cmd.finish(reply_message(event, _finish_run(state, "rebirth")))
+        ending = await rpg_ai.narrate_ending(state["character"], "rebirth")
+        text = _finish_run(state, "rebirth")
+        if ending:
+            text = ending + "\n\n" + text
+        await yes_cmd.finish(reply_message(event, text))
     if action["type"] == "escape":
         rng = _rng_for_run(state, f"escape:{datetime.now().timestamp()}")
         result = rpg_engine.roll_escape(state["character"], state["flags"]["enemy"], rng)
@@ -691,10 +1112,40 @@ def _execute_action(
         actor = result["attacker"]
         lines.append(f"{actor_name}使用了 {skill['name']}。")
         if result.get("support_only"):
-            lines.append(f"{actor_name}恢复 HP {result.get('heal', 0)}。")
+            heal = int(result.get("heal", 0))
+            if heal > 0:
+                lines.append(f"{actor_name}恢复 HP {heal}。")
+            buff = result.get("buff")
+            if buff:
+                mod_text = "、".join(
+                    f"{k}{'+' if int(v) >= 0 else ''}{int(v)}" for k, v in dict(buff.get("mods", {})).items()
+                )
+                lines.append(
+                    f"{actor_name}获得增益【{buff.get('name', '增益')}】：{mod_text}，持续 {int(buff.get('duration', 3))} 回合。"
+                )
         else:
             opponent = result["defender"]
-            lines.append(rpg_renderer.render_attack_result(actor_name, opponent_name, result))
+            hits = int(result.get("hits", 1))
+            line = rpg_renderer.render_attack_result(actor_name, opponent_name, result)
+            if hits > 1 and not result.get("dodged"):
+                line = line.replace("造成", f"连击 {hits} 段，共造成")
+            lines.append(line)
+            self_buff = skill.get("self_buff")
+            if self_buff:
+                mod_text = "、".join(
+                    f"{k}{int(v):+d}" for k, v in dict(self_buff.get("mods", {})).items()
+                )
+                lines.append(
+                    f"{actor_name}获得【{self_buff.get('name', '增益')}】：{mod_text}，持续 {int(self_buff.get('duration', 2))} 回合。"
+                )
+            enemy_debuff = skill.get("enemy_debuff")
+            if enemy_debuff and not result.get("dodged"):
+                mod_text = "、".join(
+                    f"{k}{int(v):+d}" for k, v in dict(enemy_debuff.get("mods", {})).items()
+                )
+                lines.append(
+                    f"{opponent_name}被施加【{enemy_debuff.get('name', '削弱')}】：{mod_text}，持续 {int(enemy_debuff.get('duration', 3))} 回合。"
+                )
             if not result.get("dodged"):
                 opponent, status_line = rpg_engine.apply_skill_status(skill, opponent, rng)
                 if status_line:
@@ -779,9 +1230,18 @@ def _battle_round(
                 continue
 
         turn_action = action if side == "player" else rpg_engine.choose_enemy_action(units[side], rng)
+        opponent_hp_before = int(units[opp_side].get("current_hp", 0))
         actor_after, opponent_after, act_lines = _execute_action(
             units[side], units[opp_side], turn_action, display[side], display[opp_side], rng
         )
+        if opp_side == "player" and _has_item(opponent_after, "fragile_shield") and not state["flags"].get("fragile_shield_used"):
+            damage_taken = opponent_hp_before - int(opponent_after.get("current_hp", opponent_hp_before))
+            if 0 < damage_taken <= 40:
+                max_hp = int(opponent_after.get("stats", {}).get("hp", opponent_hp_before))
+                opponent_after["current_hp"] = min(max_hp, int(opponent_after.get("current_hp", 0)) + damage_taken)
+                _consume_item_by_id(opponent_after, "fragile_shield")
+                state["flags"]["fragile_shield_used"] = True
+                act_lines.append(f"脆弱的护盾触发：抵挡了 {damage_taken} 点伤害。")
         units[side] = actor_after
         units[opp_side] = opponent_after
         lines.extend(act_lines)
@@ -807,7 +1267,27 @@ def _battle_round(
 
     state["character"] = units["player"]
     state["flags"]["enemy"] = units["enemy"]
+    if outcome == "player_defeated":
+        revive_line = _try_special_revive(state)
+        if revive_line:
+            lines.append(revive_line)
+            outcome = "continue"
     return {"outcome": outcome, "lines": lines, "item_used": item_used}
+
+
+async def _send_encounter(event, matcher, state: dict[str, Any], prefix_lines: list[str] | None = None):
+    """战斗登场：生成 AI 遭遇旁白，拼上战斗面板后发送。AI 失败则只发面板，不影响游戏。"""
+    # 战斗次数 +1（含普通/精英/Boss/社交触发战/赏金战，均收口于此）。计数器随存档持久化。
+    _ach_counters(state)["battles"] = int(_ach_counters(state).get("battles", 0)) + 1
+    _save_state(state)
+    character = state["character"]
+    enemy = state["flags"]["enemy"]
+    parts = list(prefix_lines or [])
+    intro = await rpg_ai.narrate_encounter(character, enemy)
+    if intro:
+        parts.append(intro)
+    parts.append(rpg_renderer.render_battle_state(character, enemy))
+    await matcher.finish(reply_message(event, "\n".join(parts)))
 
 
 async def _finish_battle_round(event, matcher, state: dict[str, Any], rng: random.Random, result: dict[str, Any]):
@@ -824,6 +1304,30 @@ async def _finish_battle_round(event, matcher, state: dict[str, Any], rng: rando
         enemy = state["flags"]["enemy"]
         character = _clear_combat_statuses(state["character"])  # 战斗结束清掉临时增益/持续状态
         reward = rpg_engine.boss_reward(enemy["id"], rng) if enemy.get("rank") == "boss" else rpg_engine.enemy_reward(enemy["rank"], rng)
+        # E5：技能书投放——Boss 必出高品质职业书；普通敌人约 20% 把掉落替换为职业书
+        if enemy.get("rank") == "boss":
+            book = rpg_engine.roll_skill_book(character.get("class_id"), rng, qualities=["uncommon", "legendary"])
+            if book:
+                reward["item"] = book
+        elif reward.get("item") and rng.randint(1, 100) <= 20:
+            book = rpg_engine.roll_skill_book(character.get("class_id"), rng)
+            if book:
+                reward["item"] = book
+        if _has_item(character, "rogue_gloves") and int(reward.get("gold", 0)) > 0:
+            bonus_gold = max(1, int(reward.get("gold", 0)) * 25 // 100)
+            reward["gold"] = int(reward.get("gold", 0)) + bonus_gold
+            lines.append(f"盗贼手套触发：额外获得 {bonus_gold} 金币。")
+        if state["flags"].pop("soul_gem_active", None):
+            enemy_skills = [sid for sid in enemy.get("skills", []) if sid not in character.get("skills", [])]
+            if enemy_skills:
+                learned = rng.choice(enemy_skills)
+                ok, reason = rpg_engine.learn_skill(character, learned)
+                if ok:
+                    try:
+                        skill_name = rpg_engine.get_skill_template(learned)["name"]
+                    except ValueError:
+                        skill_name = learned
+                    lines.append(f"灵魂宝石触发：学会了【{skill_name}】。")
         character, leveled = _grant_reward(character, reward)
         carry_out = reward.get("carry_out", [])
         if carry_out:
@@ -840,12 +1344,23 @@ async def _finish_battle_round(event, matcher, state: dict[str, Any], rng: rando
             lines.extend(bounty_lines)
         state["character"] = character
         state["flags"].pop("enemy", None)
-        lines.append(_render_current_floor_or_finish(state))
+        floor_text = _render_current_floor_or_finish(state)
+        if state.pop("_run_finished", None) == "victory":  # 击败最终 Boss，通关结局
+            ending = await rpg_ai.narrate_ending(state["character"], "victory")
+            if ending:
+                floor_text = ending + "\n\n" + floor_text
+        lines.append(floor_text)
         await matcher.finish(reply_message(event, "\n".join(lines)))
 
     if outcome == "player_defeated":
         _save_state(state)
-        await matcher.finish(reply_message(event, "\n".join(lines) + "\n" + _finish_run(state, "death")))
+        death_text = _finish_run(state, "death")
+        state.pop("_run_finished", None)
+        ending = await rpg_ai.narrate_ending(state["character"], "death")
+        body = "\n".join(lines)
+        if ending:
+            body += "\n\n" + ending
+        await matcher.finish(reply_message(event, body + "\n" + death_text))
 
     state["status"] = "battle"
     _save_state(state)
@@ -933,6 +1448,7 @@ async def handle_buy(event: MessageEvent, args: Message = CommandArg()):
             await buy_cmd.finish(reply_message(event, f"无法购买：{ADD_ITEM_FAIL_REASONS.get(reason, '背包放不下')}。"))
         character["gold"] = int(character.get("gold", 0)) - price
         rpg_engine.add_item_to_inventory(character, rolled["id"])
+        _sync_special_passives(character)
         stock.pop(index)  # 盲盒一次性，买走后该货位消失
         state["character"] = character
         _save_state(state)
@@ -942,6 +1458,7 @@ async def handle_buy(event: MessageEvent, args: Message = CommandArg()):
         await buy_cmd.finish(reply_message(event, f"无法购买：{ADD_ITEM_FAIL_REASONS.get(reason, '背包放不下')}。"))
     character["gold"] = int(character.get("gold", 0)) - price
     rpg_engine.add_item_to_inventory(character, item["id"])
+    _sync_special_passives(character)
     state["character"] = character
     _save_state(state)
     await buy_cmd.finish(reply_message(event, f"购买成功：{item['name']}。\n" + rpg_renderer.render_shop(stock, character["gold"])))
@@ -957,6 +1474,7 @@ async def handle_exit_shop(event: MessageEvent):
     state["flags"].pop("shop_stock", None)
     state["flags"].pop("sell_mult", None)
     state["flags"].pop("shop_discounted", None)
+    state["flags"].pop("shop_social_used", None)
     await exit_shop_cmd.finish(reply_message(event, "你离开了商店。\n" + _render_current_floor_or_finish(state)))
 
 
@@ -968,10 +1486,18 @@ async def _handle_social(event: MessageEvent, matcher_name: str):
         await social_cmds[matcher_name].finish(reply_message(event, "当前没有可社交的事件。"))
 
     is_shop = state["status"] == "shop"
+    # 每家店的社交机会只有一次：判定过（无论成败）就不能再社交，避免反复 /说服 刷判定。
+    if is_shop and state["flags"].get("shop_social_used"):
+        await social_cmds[matcher_name].finish(reply_message(
+            event,
+            "你已经和这家店的老板交涉过了，他不会再理会第二次。\n"
+            + rpg_renderer.render_shop(state["flags"].get("shop_stock", []), int(state["character"].get("gold", 0))),
+        ))
     rng = _rng_for_run(state, f"social:{matcher_name}:{datetime.now().timestamp()}")
     character = state["character"]
     affinity = int(state["flags"].get("npc_affinity", 0))
     result = rpg_engine.resolve_social_action(matcher_name, character, affinity, rng)
+    _record_social_attempt(state, matcher_name, bool(result["success"]))
     lines = [
         f"{matcher_name} 判定：d20={result['roll']}，成功率 {result['rate']:.1f}%。",
         "判定成功。" if result["success"] else "判定失败。",
@@ -991,6 +1517,7 @@ async def _handle_social(event: MessageEvent, matcher_name: str):
     # —— 商店社交：成功 → 全场折扣（每家店仅一次）并留在商品页；「说服」失败也留在商品页（无折扣）；
     #    「欺骗/威吓」失败被赶出商店（不打架）——
     if is_shop:
+        state["flags"]["shop_social_used"] = True  # 标记本店社交机会已用掉
         stock = state["flags"].get("shop_stock", [])
         if result["success"]:
             if state["flags"].get("shop_discounted"):
@@ -1027,8 +1554,7 @@ async def _handle_social(event: MessageEvent, matcher_name: str):
         state["status"] = "battle"
         _save_state(state)
         lines.append("社交失败引发了战斗。")
-        lines.append(rpg_renderer.render_battle_state(character, enemy))
-        await social_cmds[matcher_name].finish(reply_message(event, "\n".join(lines)))
+        await _send_encounter(event, social_cmds[matcher_name], state, lines)
 
     _save_state(state)
     lines.append(_render_current_floor_or_finish(state))
@@ -1068,13 +1594,13 @@ async def _handle_number(event: MessageEvent, number: int):
             state["flags"]["enemy"] = enemy
             state["status"] = "battle"
             _save_state(state)
-            await number_cmds[str(number)].finish(reply_message(event, rpg_renderer.render_battle_state(character, enemy)))
+            await _send_encounter(event, number_cmds[str(number)], state)
         if node_type == "boss":
             enemy = rpg_engine.generate_boss(choice["boss_id"], rng)
             state["flags"]["enemy"] = enemy
             state["status"] = "battle"
             _save_state(state)
-            await number_cmds[str(number)].finish(reply_message(event, rpg_renderer.render_battle_state(character, enemy)))
+            await _send_encounter(event, number_cmds[str(number)], state)
         if node_type == "rest":
             state["character"] = rpg_engine.apply_rest(character)
             _save_state(state)
@@ -1083,15 +1609,35 @@ async def _handle_number(event: MessageEvent, number: int):
             random_stats = character["random_stats"]
             stock = rpg_engine.generate_shop_stock(
                 random_stats["luck"], random_stats["charm"], rng,
-                discount=int(character.get("shop_discount", 0)),
+                discount=int(character.get("shop_discount", 0)) + _special_shop_discount(character),
             )
+            if _has_item(character, "treasure_map_fragment"):
+                extra = rpg_engine.generate_shop_stock(
+                    random_stats["luck"], random_stats["charm"], rng,
+                    count=1,
+                    discount=int(character.get("shop_discount", 0)) + _special_shop_discount(character),
+                )
+                stock.extend(extra)
+                _consume_item_by_id(character, "treasure_map_fragment")
+            # E5：约 35% 概率上架一本职业技能书（普通~稀有品质池）
+            if rng.randint(1, 100) <= 35:
+                book = rpg_engine.roll_skill_book(
+                    character.get("class_id"), rng, qualities=["common", "practical", "rare"]
+                )
+                if book:
+                    book = dict(book)
+                    book["quality_score"] = 0
+                    book["final_price"] = max(1, int(book.get("price", 0)))
+                    stock.append(book)
             state["flags"]["shop_stock"] = stock
             state["flags"].pop("shop_discounted", None)  # 新店重置社交折扣资格
+            state["flags"].pop("shop_social_used", None)  # 新店重置社交机会
             state["status"] = "shop"
             _save_state(state)
             await number_cmds[str(number)].finish(reply_message(event, rpg_renderer.render_shop(stock, character.get("gold", 0))))
         if node_type == "mystery":
-            outcome = rpg_engine.random_event_outcome(character["random_stats"]["luck"], rng)
+            reputation = int(state.get("flags", {}).get("start_reputation", 0))
+            outcome = rpg_engine.random_event_outcome(character["random_stats"]["luck"], rng, reputation)
             pool_name = outcome  # positive / negative / neutral
             if (
                 outcome == "positive"
@@ -1123,13 +1669,78 @@ async def _handle_number(event: MessageEvent, number: int):
             _save_state(state)
             await number_cmds[str(number)].finish(reply_message(event, text + "\n" + _render_current_floor_or_finish(state)))
         if node_type == "npc":
-            affinity = rpg_engine.npc_initial_affinity(0, character["random_stats"]["charm"], rng)
+            reputation = int(state.get("flags", {}).get("start_reputation", 0))
+            affinity = rpg_engine.npc_initial_affinity(reputation, character["random_stats"]["charm"], rng)
             npc_evt = rng.choice(rpg_data.EVENT_POOLS["npc"])
             state["flags"]["npc_affinity"] = affinity
             state["flags"]["pending_event"] = npc_evt
             state["status"] = "event_choice"
             _save_state(state)
             await number_cmds[str(number)].finish(reply_message(event, _render_event_choices(npc_evt)))
+
+    if state["status"] == "inventory":
+        inventory = state["character"].get("inventory", [])
+        if number < 1 or number > len(inventory):
+            await number_cmds[str(number)].finish(reply_message(event, "没有这个背包编号。"))
+        entry = inventory[number - 1]
+        item = rpg_engine.get_item_template(entry["id"])
+        m = number_cmds[str(number)]
+        # 技能书：局外学习（不走消耗品结算）
+        if item.get("type") == "skillbook":
+            character = state["character"]
+            skill_id = str(item.get("effects", {}).get("learn_skill", ""))
+            try:
+                skill_name = rpg_engine.get_skill_template(skill_id)["name"]
+            except ValueError:
+                skill_name = skill_id
+            ok, reason = rpg_engine.learn_skill(character, skill_id)
+            if ok:
+                _consume_entry(character, entry)
+                state["character"] = character
+                _save_state(state)
+                lines = [f"📖 学会了技能【{skill_name}】！", "", rpg_renderer.render_skills(character),
+                         "", rpg_renderer.render_inventory(character, in_page=True)]
+                await m.finish(reply_message(event, "\n".join(lines)))
+            if reason == "already_known":
+                refund = max(1, int(item.get("price", 0)) // 2)
+                _consume_entry(character, entry)
+                character["gold"] = int(character.get("gold", 0)) + refund
+                state["character"] = character
+                _save_state(state)
+                await m.finish(reply_message(
+                    event,
+                    f"你已经会【{skill_name}】了，把这本重复的书卖了换得 {refund} 金币。\n"
+                    + rpg_renderer.render_inventory(character, in_page=True),
+                ))
+            # slots_full：不消耗，提示先遗忘
+            await m.finish(reply_message(
+                event,
+                f"技能栏已满（{rpg_data.MAX_SKILL_SLOTS} 个），无法学习【{skill_name}】。\n"
+                f"请先 /遗忘 <编号> 腾出位置：\n" + rpg_renderer.render_skills(character),
+            ))
+        rng = _rng_for_run(state, f"special:{number}:{datetime.now().timestamp()}")
+        special_text = _handle_active_special_item(state, entry, item, rng)
+        if special_text is not None:
+            await m.finish(reply_message(event, special_text))
+        if rpg_engine.is_special_item(item):
+            await m.finish(reply_message(event, f"{item['name']} 是特殊道具：{item.get('description', '')}\n被动或收藏效果无需主动使用，通关后可带出局外背包。"))
+        category = rpg_engine.item_category(item)
+        if category == "equipment":
+            await number_cmds[str(number)].finish(
+                reply_message(event, f"{item['name']} 是装备，请发送 /装备 {number} 穿戴它。")
+            )
+        if category == "attribute":
+            await number_cmds[str(number)].finish(
+                reply_message(event, f"{item['name']} 是熟悉道具（饰品），持有即被动生效，无需主动使用。")
+            )
+        # 消耗品：局外使用，结算自身效果后扣除一件
+        rng = _rng_for_run(state, f"useitem:{number}:{datetime.now().timestamp()}")
+        character, eff_lines = rpg_engine.apply_consumable_effects(state["character"], item, rng)
+        _consume_entry(character, entry)
+        state["character"] = character
+        _save_state(state)
+        lines = [f"使用了 {item['name']}。", *eff_lines, "", rpg_renderer.render_inventory(character, in_page=True)]
+        await number_cmds[str(number)].finish(reply_message(event, "\n".join(lines)))
 
     if state["status"] == "skill_select":
         skills = state["character"].get("skills", [])
@@ -1146,6 +1757,14 @@ async def _handle_number(event: MessageEvent, number: int):
         entry = consumables[number - 1]
         item = rpg_engine.get_item_template(entry["id"])
         rng = _rng_for_run(state, f"item:{number}:{datetime.now().timestamp()}")
+        special_text = _handle_active_special_item(state, entry, item, rng)
+        if special_text is not None:
+            effect = rpg_engine.special_effect_id(item)
+            if state.get("flags", {}).get("enemy") and effect not in {"battle_escape", "skip_floor", "rewind_round"}:
+                followup = _enemy_followup_after_item(state, rng)
+                followup["lines"] = [special_text, *followup.get("lines", [])]
+                await _finish_battle_round(event, number_cmds[str(number)], state, rng, followup)
+            await number_cmds[str(number)].finish(reply_message(event, special_text))
         if state["flags"].get("enemy"):  # 战斗中：使用道具占用一个回合，敌人随后行动
             result = _battle_round(state, {"type": "item", "item": item}, rng)
             if result.get("item_used"):
@@ -1202,6 +1821,7 @@ async def _handle_number(event: MessageEvent, number: int):
             state["flags"].pop("pending_event", None)
             state["flags"]["shop_stock"] = stock
             state["flags"].pop("shop_discounted", None)  # 新店重置社交折扣资格
+            state["flags"].pop("shop_social_used", None)  # 新店重置社交机会
             state["status"] = "shop"
             _save_state(state)
             await m.finish(reply_message(event, head + "\n" + rpg_renderer.render_shop(stock, int(character.get("gold", 0)))))
@@ -1226,7 +1846,7 @@ async def _handle_number(event: MessageEvent, number: int):
             state["flags"]["enemy"] = enemy
             state["status"] = "battle"
             _save_state(state)
-            await m.finish(reply_message(event, head + "\n接下了任务，目标出现了！\n" + rpg_renderer.render_battle_state(character, enemy)))
+            await _send_encounter(event, m, state, [head, "接下了任务，目标出现了！"])
 
         if opt_type == "social":  # 二级：选社交行为后再判定
             state["flags"]["pending_social"] = {
@@ -1264,6 +1884,7 @@ async def _handle_number(event: MessageEvent, number: int):
         rng = _rng_for_run(state, f"social:{number}:{datetime.now().timestamp()}")
         action = actions[number]
         result = rpg_engine.resolve_social_action(action, character, affinity, rng)
+        _record_social_attempt(state, action, bool(result["success"]))
         state["flags"].pop("pending_social", None)
         state["flags"].pop("npc_affinity", None)
         lines = [f"【{action}】判定：d20={result['roll']}，成功率 {result['rate']:.1f}% —— " + ("成功！" if result["success"] else "失败。")]
@@ -1290,8 +1911,7 @@ async def _handle_number(event: MessageEvent, number: int):
             state["status"] = "battle"
             _save_state(state)
             lines.append("交涉破裂，引发了战斗！")
-            lines.append(rpg_renderer.render_battle_state(character, enemy))
-            await m.finish(reply_message(event, "\n".join(lines)))
+            await _send_encounter(event, m, state, lines)
         lines.append(_render_current_floor_or_finish(state))
         await m.finish(reply_message(event, "\n".join(lines)))
 

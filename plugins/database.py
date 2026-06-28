@@ -8,6 +8,22 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parents[1] / "data" / "chat_history.sqlite3"
 MAX_PET_LEVEL = 20
 MAX_PET_AFFECTION = 100
+MAX_RPG_PLAYER_LEVEL = 100
+RPG_PLAYER_EXP_PER_LEVEL = 100
+RPG_REPUTATION_MIN = -999
+RPG_REPUTATION_MAX = 999
+RPG_REPUTATION_TITLES = [
+    (-999, -500, "遗臭万年"),
+    (-499, -200, "臭名远扬"),
+    (-199, -50, "人见人嫌"),
+    (-49, -1, "略讨人嫌"),
+    (0, 19, "籍籍无名"),
+    (20, 49, "小有名气"),
+    (50, 199, "人见人爱"),
+    (200, 499, "声名远扬"),
+    (500, 799, "一代宗师"),
+    (800, 999, "传奇英雄"),
+]
 PET_TYPES = [
     ("耄耋", 1, 100),
     ("小团雀", 1, 20),
@@ -199,11 +215,15 @@ def init_db() -> None:
                 total_runs INTEGER NOT NULL DEFAULT 0,
                 wins INTEGER NOT NULL DEFAULT 0,
                 deaths INTEGER NOT NULL DEFAULT 0,
+                gm_welcome_date TEXT,
+                gm_welcome_text TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        _ensure_column(conn, "rpg_players", "gm_welcome_date", "TEXT")
+        _ensure_column(conn, "rpg_players", "gm_welcome_text", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rpg_runs (
@@ -254,6 +274,42 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_rpg_run_logs_run_created
             ON rpg_run_logs (run_id, created_at, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rpg_player_items (
+                user_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, item_id),
+                FOREIGN KEY (user_id) REFERENCES rpg_players(user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rpg_player_items_user_updated
+            ON rpg_player_items (user_id, updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rpg_achievements (
+                user_id INTEGER NOT NULL,
+                achievement_id TEXT NOT NULL,
+                unlocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, achievement_id),
+                FOREIGN KEY (user_id) REFERENCES rpg_players(user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_rpg_achievements_user
+            ON rpg_achievements (user_id, unlocked_at)
             """
         )
         conn.executemany(
@@ -943,6 +999,98 @@ def _decode_json_field(row: sqlite3.Row, field: str, default: object) -> object:
         return default
 
 
+def rpg_player_exp_to_next_level(level: int) -> int | None:
+    level = int(level)
+    if level >= MAX_RPG_PLAYER_LEVEL:
+        return None
+    return RPG_PLAYER_EXP_PER_LEVEL * max(1, level)
+
+
+def calculate_rpg_player_level(level: int, exp: int, exp_delta: int = 0) -> tuple[int, int, int]:
+    level = max(1, min(MAX_RPG_PLAYER_LEVEL, int(level)))
+    exp = max(0, int(exp) + int(exp_delta))
+    leveled = 0
+
+    while level < MAX_RPG_PLAYER_LEVEL:
+        required = rpg_player_exp_to_next_level(level)
+        if required is None or exp < required:
+            break
+        exp -= required
+        level += 1
+        leveled += 1
+
+    if level >= MAX_RPG_PLAYER_LEVEL:
+        level = MAX_RPG_PLAYER_LEVEL
+        exp = 0
+
+    return level, exp, leveled
+
+
+def calculate_rpg_reputation_title(reputation: int) -> str:
+    reputation = max(RPG_REPUTATION_MIN, min(RPG_REPUTATION_MAX, int(reputation)))
+    for minimum, maximum, title in RPG_REPUTATION_TITLES:
+        if minimum <= reputation <= maximum:
+            return title
+    return "籍籍无名"
+
+
+def _apply_rpg_player_progress(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    exp_amount: int = 0,
+    reputation_delta: int = 0,
+    title: str | None = None,
+    total_runs_delta: int = 0,
+    wins_delta: int = 0,
+    deaths_delta: int = 0,
+) -> int:
+    row = conn.execute(
+        """
+        SELECT level, exp, reputation
+        FROM rpg_players
+        WHERE user_id = ?
+        """,
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"missing rpg player: {user_id}")
+
+    level, exp, leveled = calculate_rpg_player_level(row["level"], row["exp"], exp_amount)
+    reputation = max(
+        RPG_REPUTATION_MIN,
+        min(RPG_REPUTATION_MAX, int(row["reputation"]) + int(reputation_delta)),
+    )
+    current_title = title if title is not None else calculate_rpg_reputation_title(reputation)
+    values: list[object] = [
+        level,
+        exp,
+        reputation,
+        current_title,
+        int(total_runs_delta),
+        int(wins_delta),
+        int(deaths_delta),
+    ]
+    values.append(int(user_id))
+    conn.execute(
+        f"""
+        UPDATE rpg_players
+        SET
+            level = ?,
+            exp = ?,
+            reputation = ?,
+            title = ?,
+            total_runs = total_runs + ?,
+            wins = wins + ?,
+            deaths = deaths + ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?
+        """,
+        values,
+    )
+    return leveled
+
+
 def ensure_rpg_player(user_id: int) -> None:
     with _connect() as conn:
         conn.execute(
@@ -960,7 +1108,7 @@ def get_rpg_player(user_id: int) -> sqlite3.Row:
         return conn.execute(
             """
             SELECT user_id, level, exp, reputation, title, total_runs, wins, deaths,
-                   created_at, updated_at
+                   gm_welcome_date, gm_welcome_text, created_at, updated_at
             FROM rpg_players
             WHERE user_id = ?
             """,
@@ -976,32 +1124,98 @@ def add_rpg_player_progress(
 ) -> sqlite3.Row:
     ensure_rpg_player(user_id)
     with _connect() as conn:
-        if title is None:
-            conn.execute(
-                """
-                UPDATE rpg_players
-                SET
-                    exp = MAX(0, exp + ?),
-                    reputation = MIN(999, MAX(-999, reputation + ?)),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-                """,
-                (int(exp_amount), int(reputation_delta), int(user_id)),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE rpg_players
-                SET
-                    exp = MAX(0, exp + ?),
-                    reputation = MIN(999, MAX(-999, reputation + ?)),
-                    title = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?
-                """,
-                (int(exp_amount), int(reputation_delta), title, int(user_id)),
-            )
+        _apply_rpg_player_progress(
+            conn,
+            user_id,
+            exp_amount=exp_amount,
+            reputation_delta=reputation_delta,
+            title=title,
+        )
     return get_rpg_player(user_id)
+
+
+def set_rpg_player_gm_welcome(user_id: int, welcome_date: str, welcome_text: str) -> sqlite3.Row:
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE rpg_players
+            SET
+                gm_welcome_date = ?,
+                gm_welcome_text = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+            """,
+            (welcome_date, welcome_text, int(user_id)),
+        )
+    return get_rpg_player(user_id)
+
+
+def add_rpg_player_items(user_id: int, item_ids: list[str] | tuple[str, ...]) -> None:
+    ensure_rpg_player(user_id)
+    counts: dict[str, int] = {}
+    for item_id in item_ids:
+        item_id = str(item_id)
+        if not item_id:
+            continue
+        counts[item_id] = counts.get(item_id, 0) + 1
+    if not counts:
+        return
+
+    with _connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO rpg_player_items (user_id, item_id, quantity)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET
+                quantity = quantity + excluded.quantity,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            [(int(user_id), item_id, quantity) for item_id, quantity in counts.items()],
+        )
+
+
+def list_rpg_player_items(user_id: int) -> list[sqlite3.Row]:
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, item_id, quantity, acquired_at, updated_at
+            FROM rpg_player_items
+            WHERE user_id = ? AND quantity > 0
+            ORDER BY acquired_at, item_id
+            """,
+            (int(user_id),),
+        ).fetchall()
+
+
+def unlock_rpg_achievement(user_id: int, achievement_id: str) -> bool:
+    """记录一条成就解锁。返回 True 表示这次是首次解锁（已存在则返回 False）。"""
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO rpg_achievements (user_id, achievement_id)
+            VALUES (?, ?)
+            """,
+            (int(user_id), str(achievement_id)),
+        )
+        return cursor.rowcount > 0
+
+
+def list_rpg_achievements(user_id: int) -> set[str]:
+    """返回该玩家已解锁的成就 id 集合。"""
+    ensure_rpg_player(user_id)
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT achievement_id
+            FROM rpg_achievements
+            WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ).fetchall()
+    return {str(row["achievement_id"]) for row in rows}
 
 
 def create_rpg_run(
@@ -1154,7 +1368,7 @@ def finish_rpg_run(
 
     user_id = int(run["user_id"])
     with _connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE rpg_runs
             SET
@@ -1162,29 +1376,22 @@ def finish_rpg_run(
                 result = ?,
                 finished_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = ? AND finished_at IS NULL
             """,
             (status, result, int(run_id)),
         )
-        conn.execute(
-            """
-            UPDATE rpg_players
-            SET
-                total_runs = total_runs + 1,
-                wins = wins + ?,
-                deaths = deaths + ?,
-                exp = MAX(0, exp + ?),
-                reputation = MIN(999, MAX(-999, reputation + ?)),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?
-            """,
-            (
-                1 if won else 0,
-                1 if died else 0,
-                int(exp_amount),
-                int(reputation_delta),
-                user_id,
-            ),
+        # 同一局可能因重复消息或并发处理走到两次结算。只有第一个成功把
+        # finished_at 从 NULL 改掉的调用，才允许继续发放局外奖励。
+        if cursor.rowcount == 0:
+            return None
+        _apply_rpg_player_progress(
+            conn,
+            user_id,
+            exp_amount=exp_amount,
+            reputation_delta=reputation_delta,
+            total_runs_delta=1,
+            wins_delta=1 if won else 0,
+            deaths_delta=1 if died else 0,
         )
     return get_rpg_run(run_id)
 
