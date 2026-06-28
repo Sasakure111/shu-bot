@@ -34,14 +34,20 @@ aiohttp
 python-dotenv
 ```
 
-安装（任选其一）：
+安装：
 
 ```bash
-# 用 pip
-pip install "nonebot2[fastapi]" nonebot-adapter-onebot nonebot-plugin-apscheduler openai aiohttp python-dotenv
+# 推荐使用虚拟环境
+python -m venv .venv
 
-# 或用 nb-cli（依赖已在 pyproject.toml 声明）
-pip install nb-cli
+# Linux / macOS
+source .venv/bin/activate
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+# 安装项目及全部运行依赖
+pip install -e .
 ```
 
 ## 🚀 快速开始
