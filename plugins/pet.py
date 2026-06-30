@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import os
 from datetime import date, datetime, timedelta
@@ -66,6 +67,10 @@ BOSS_REWARD_AFFECTION = 8
 BOSS_SPECIAL_REWARD_RATE = 18
 BOSS_ATTACK_COOLDOWN_SECONDS = 15
 BOSS_BROADCAST_INTERVAL_MINUTES = 120
+BROADCAST_WINDOW_START_HOUR = 9
+BROADCAST_WINDOW_END_HOUR = 23
+BROADCAST_SEND_DELAY_MIN_SECONDS = 2
+BROADCAST_SEND_DELAY_MAX_SECONDS = 5
 BATTLE_REWARD_EXP = 24
 BATTLE_WIN_AFFECTION = 4
 BATTLE_LOSE_AFFECTION = -3
@@ -79,6 +84,7 @@ pending_battles: dict[int, dict[str, object]] = {}
 next_wild_broadcast_at = datetime.now() + timedelta(
     minutes=random.randint(WILD_BROADCAST_MIN_MINUTES, WILD_BROADCAST_MAX_MINUTES)
 )
+next_boss_broadcast_at = datetime.now() + timedelta(minutes=BOSS_BROADCAST_INTERVAL_MINUTES)
 
 
 def rarity_stars(rarity: int) -> str:
@@ -98,6 +104,11 @@ def context_from_event(event: MessageEvent) -> tuple[str, int, str]:
 def ensure_default_broadcast_for_event(event: MessageEvent) -> None:
     target_type, target_id, _ = context_from_event(event)
     ensure_broadcast_target(target_type, target_id)
+
+
+def is_broadcast_window(now: datetime | None = None) -> bool:
+    now = now or datetime.now()
+    return BROADCAST_WINDOW_START_HOUR <= now.hour < BROADCAST_WINDOW_END_HOUR
 
 
 def format_pet_status(pet) -> str:
@@ -246,14 +257,14 @@ async def build_pet_interaction(pet) -> str:
     return response.choices[0].message.content.strip()[:100]
 
 
-async def send_wild_pet(bot: Bot, target_type: str, target_id: int) -> None:
+async def send_wild_pet(bot: Bot, target_type: str, target_id: int) -> bool:
     pet_type = random_wild_pet_type()
     if pet_type is None:
-        return
+        return False
 
     context_key = f"{target_type}:{target_id}"
     expires_at = datetime.now() + timedelta(minutes=WILD_EXPIRE_MINUTES)
-    active_wild_pets[context_key] = {
+    wild_state = {
         "type_id": int(pet_type["id"]),
         "expires_at": expires_at,
         "tried_users": set(),
@@ -272,11 +283,14 @@ async def send_wild_pet(bot: Bot, target_type: str, target_id: int) -> None:
             await bot.send_private_msg(user_id=target_id, message=message)
     except Exception as exc:
         print(f"[PET] 野生宠物播报失败: {target_type}:{target_id} {type(exc).__name__}: {exc}")
+        return False
 
+    active_wild_pets[context_key] = wild_state
+    return True
 
-async def send_group_boss(bot: Bot, group_id: int) -> None:
+async def send_group_boss(bot: Bot, group_id: int) -> bool:
     if group_id in active_group_bosses:
-        return
+        return False
 
     name = random.choice(BOSS_NAMES)
     boss_level = random.randint(1, 5)
@@ -287,7 +301,7 @@ async def send_group_boss(bot: Bot, group_id: int) -> None:
     boss_attack = int(base_atk * (1.5 ** boss_level))
     boss_speed = int(base_spd * (1.5 ** boss_level))
     expires_at = datetime.now() + timedelta(minutes=BOSS_EXPIRE_MINUTES)
-    active_group_bosses[group_id] = {
+    boss_state = {
         "name": name,
         "level": boss_level,
         "hp": max_hp,
@@ -302,15 +316,21 @@ async def send_group_boss(bot: Bot, group_id: int) -> None:
         "defeated_pets": set(),
         "last_attack_at": {},
     }
-    await bot.send_group_msg(
-        group_id=group_id,
-        message=(
-            f"⚔️ 公屏 Boss 出现：{name}（Lv.{boss_level}）\n"
-            f"血量: {max_hp} | 攻击: {boss_attack} | 速度: {boss_speed}\n"
-            f"限时 {BOSS_EXPIRE_MINUTES} 分钟，@我并发送 /讨伐 参与挑战！"
-        ),
-    )
+    try:
+        await bot.send_group_msg(
+            group_id=group_id,
+            message=(
+                f"⚔️ 公屏 Boss 出现：{name}（Lv.{boss_level}）\n"
+                f"血量: {max_hp} | 攻击: {boss_attack} | 速度: {boss_speed}\n"
+                f"限时 {BOSS_EXPIRE_MINUTES} 分钟，@我并发送 /讨伐 参与挑战！"
+            ),
+        )
+    except Exception as exc:
+        print(f"[PET] Boss 播报失败: group:{group_id} {type(exc).__name__}: {exc}")
+        return False
 
+    active_group_bosses[group_id] = boss_state
+    return True
 
 async def expire_group_bosses() -> None:
     if not active_group_bosses:
@@ -318,6 +338,7 @@ async def expire_group_bosses() -> None:
 
     bot = get_bot()
     now = datetime.now()
+    can_announce_expiry = is_broadcast_window(now)
     expired_group_ids = [
         group_id
         for group_id, boss in active_group_bosses.items()
@@ -326,6 +347,8 @@ async def expire_group_bosses() -> None:
     for group_id in expired_group_ids:
         boss = active_group_bosses.pop(group_id, None)
         if boss is None:
+            continue
+        if not can_announce_expiry:
             continue
         try:
             await bot.send_group_msg(
@@ -400,9 +423,23 @@ def reset_next_wild_broadcast_time() -> None:
     )
 
 
+def reset_next_boss_broadcast_time() -> None:
+    global next_boss_broadcast_at
+    next_boss_broadcast_at = datetime.now() + timedelta(minutes=BOSS_BROADCAST_INTERVAL_MINUTES)
+
+
+async def wait_between_broadcast_targets() -> None:
+    await asyncio.sleep(
+        random.uniform(BROADCAST_SEND_DELAY_MIN_SECONDS, BROADCAST_SEND_DELAY_MAX_SECONDS)
+    )
+
+
 @scheduler.scheduled_job("interval", minutes=1, id="pet_wild_broadcast")
 async def pet_wild_broadcast() -> None:
-    if datetime.now() < next_wild_broadcast_at:
+    now = datetime.now()
+    if not is_broadcast_window(now):
+        return
+    if now < next_wild_broadcast_at:
         return
 
     reset_next_wild_broadcast_time()
@@ -411,12 +448,21 @@ async def pet_wild_broadcast() -> None:
         return
 
     bot = get_bot()
-    for target in targets:
+    for index, target in enumerate(targets):
+        if index > 0:
+            await wait_between_broadcast_targets()
         await send_wild_pet(bot, target["target_type"], int(target["target_id"]))
 
 
-@scheduler.scheduled_job("interval", minutes=BOSS_BROADCAST_INTERVAL_MINUTES, id="pet_group_boss_broadcast")
+@scheduler.scheduled_job("interval", minutes=1, id="pet_group_boss_broadcast")
 async def pet_group_boss_broadcast() -> None:
+    now = datetime.now()
+    if not is_broadcast_window(now):
+        return
+    if now < next_boss_broadcast_at:
+        return
+
+    reset_next_boss_broadcast_time()
     targets = [
         target
         for target in get_enabled_broadcast_targets()
@@ -426,11 +472,10 @@ async def pet_group_boss_broadcast() -> None:
         return
 
     bot = get_bot()
-    for target in targets:
-        try:
-            await send_group_boss(bot, int(target["target_id"]))
-        except Exception as exc:
-            print(f"[PET] Boss 播报失败: group:{target['target_id']} {type(exc).__name__}: {exc}")
+    for index, target in enumerate(targets):
+        if index > 0:
+            await wait_between_broadcast_targets()
+        await send_group_boss(bot, int(target["target_id"]))
 
 
 @scheduler.scheduled_job("interval", minutes=1, id="pet_boss_expire_check")
@@ -455,6 +500,7 @@ PET_MENU_TEXT = """🐾 宠物菜单
 ⚔️ 玩法
   /捕捉                  (捕捉播报出现的野生宠物)
   /讨伐                  (参与群聊公屏Boss)
+  野生宠物/BOSS自动播报仅在每天 09:00-23:00 触发
   /发起对战 @用户        (发起宠物对战)
   /接受挑战              (接受别人发起的宠物对战)
 
@@ -962,7 +1008,7 @@ async def handle_enable_broadcast(event: MessageEvent):
 
     target_type, target_id, _ = context_from_event(event)
     set_broadcast_enabled(target_type, target_id, True)
-    await enable_broadcast_cmd.finish(reply_message(event, "已开启野生宠物播报。"))
+    await enable_broadcast_cmd.finish(reply_message(event, "已开启野生宠物/BOSS播报。自动播报仅在每天 09:00-23:00 触发。"))
 
 
 @disable_broadcast_cmd.handle()
@@ -972,4 +1018,4 @@ async def handle_disable_broadcast(event: MessageEvent):
 
     target_type, target_id, _ = context_from_event(event)
     set_broadcast_enabled(target_type, target_id, False)
-    await disable_broadcast_cmd.finish(reply_message(event, "已关闭野生宠物播报。"))
+    await disable_broadcast_cmd.finish(reply_message(event, "已关闭野生宠物/BOSS播报。"))
